@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "swiss-legal-research": {
+      "command": "python",
+      "args": ["/path/to/swiss-legal-agent/mcp_server.py"],
+      "env": {
+        "TAVILY_API_KEY": "your-tavily-key-here"
+      }
+    }
+  }
+}
