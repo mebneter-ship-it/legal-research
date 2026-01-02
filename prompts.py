@@ -361,12 +361,31 @@ Alle Zitate und Links aus den Recherche-Ergebnissen MÜSSEN im Output erscheinen
 - kantonale Gesetzes-Nummern: SR 220, SR 210 → exakt übernehmen
 - NIEMALS Links weglassen, kürzen oder umschreiben!
 
-MARKDOWN LINK FORMAT (PFLICHT!):
-Verwende IMMER das Format [Text](URL) für klickbare Links:
-- RICHTIG: [Art. 626 ZGB](https://www.fedlex.admin.ch/eli/cc/24/233_245_233/de#art_626)
-- RICHTIG: [BGE 136 I 87](https://www.bger.ch/...)
-- FALSCH: Art. 626 ZGB - https://...
-- FALSCH: **Art. 626 ZGB** (ohne Link)
+=== MARKDOWN LINK FORMAT (ABSOLUT PFLICHT!) ===
+JEDE Erwähnung eines Artikels oder BGE MUSS ein klickbarer Markdown-Link sein!
+
+FORMAT: [Artikelname](URL)
+
+FEDLEX ARTIKEL-LINKS mit Anker konstruieren:
+- Basis-URL aus Recherche + #art_XXX Anker hinzufügen
+- Art. 261bis StGB → [Art. 261bis StGB](https://www.fedlex.admin.ch/eli/cc/54/757_781_799/de#art_261_bis)
+- Art. 626 ZGB → [Art. 626 ZGB](https://www.fedlex.admin.ch/eli/cc/24/233_245_233/de#art_626)
+- Art. 58 Abs. 1 OR → [Art. 58 Abs. 1 OR](https://www.fedlex.admin.ch/eli/cc/27/317_321_377/de#art_58)
+
+BGE-LINKS:
+- BGE 136 I 87 → [BGE 136 I 87](https://www.bger.ch/ext/eurospider/live/de/php/clir/http/index.php?highlight_docid=atf://136-I-87:de)
+
+VERBOTEN (NIEMALS SO SCHREIBEN!):
+❌ __Art. 261bis StGB__ (Bold ohne Link)
+❌ **Art. 261bis StGB** (Bold ohne Link)  
+❌ Art. 261bis StGB - https://... (Link separat)
+❌ Art. 261bis StGB (kein Link)
+
+RICHTIG (IMMER SO SCHREIBEN!):
+✅ [Art. 261bis StGB](https://www.fedlex.admin.ch/eli/cc/54/757_781_799/de#art_261_bis)
+✅ [BGE 136 I 87](https://www.bger.ch/...)
+
+Wenn du einen Artikel erwähnst und KEINEN Link setzt, ist das ein FEHLER!
 === ENDE CITATION RULES ===
 
 
