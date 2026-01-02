@@ -1,14 +1,16 @@
 """
 Swiss Legal Research - Multi-Agent System using LangGraph
 
-This module implements a supervisor-based multi-agent architecture:
-- Supervisor: Routes queries to appropriate specialist agents
-- Primary Law Agent: Searches and analyzes Swiss federal law
-- Case Law Agent: Searches and analyzes BGE decisions  
-- Analysis Agent: Synthesizes research into comprehensive analysis
+This module implements a smart orchestrator-based multi-agent architecture:
+- Orchestrator: Analyzes query, enriches context, dispatches to agents in parallel
+- Primary Law Agent: Searches Swiss federal law (Fedlex)
+- Cantonal Law Agent: Searches cantonal law (if canton detected)
+- Case Law Agent: Searches BGE decisions
+- Analysis Agent: Synthesizes all research into comprehensive analysis
 """
 
 import os
+import concurrent.futures
 from typing import TypedDict, Annotated, Literal, Sequence
 from dotenv import load_dotenv
 
@@ -19,7 +21,16 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from tools import search_swiss_primary_law, search_swiss_case_law, search_general_legal
+from tools import (
+    search_swiss_primary_law, 
+    search_swiss_case_law, 
+    search_cantonal_law,
+    search_cantonal_case_law,
+    search_communal_law,
+    detect_canton,
+    detect_commune,
+    CANTON_NAMES
+)
 
 
 def get_llm():
@@ -45,159 +56,270 @@ def get_llm():
 
 class ResearchState(TypedDict):
     """State passed between agents in the research pipeline"""
-    # The original legal question
+    # Original question
     question: str
-    # Optional user document to analyze
+    # Optional user document
     document: str
-    # Results from primary law search
+    
+    # Orchestrator context (enriched by analyze step)
+    detected_canton: str          # e.g., "AI", "ZH"
+    detected_canton_name: str     # e.g., "Appenzell Innerrhoden"
+    detected_commune: str         # e.g., "Appenzell"
+    legal_domain: str             # e.g., "Baurecht", "Mietrecht"
+    enriched_queries: dict        # Queries tailored for each agent
+    
+    # Agent results
     primary_law_results: str
-    # Results from case law search  
+    cantonal_law_results: str
     case_law_results: str
-    # Final synthesized analysis
+    
+    # Final output
     final_analysis: str
-    # Current stage in the pipeline
     current_stage: str
-    # Any errors encountered
     errors: list[str]
 
 
 # ============================================================
-# AGENT DEFINITIONS
+# ORCHESTRATOR: ANALYZE & ENRICH
 # ============================================================
 
-PRIMARY_LAW_PROMPT = """You are a Swiss primary law specialist. Your role is to:
-1. Analyze search results from Swiss federal law sources (Fedlex, admin.ch)
-2. Identify relevant legal provisions (Articles, Paragraphs, SR numbers)
-3. Cite precisely: Art. X Abs. Y [Law Name] (SR [number])
-4. NEVER invent or hallucinate legal provisions
+def run_orchestrator_analyze(state: ResearchState) -> ResearchState:
+    """
+    Orchestrator Step 1: Analyze query and enrich context for all agents.
+    
+    This is the BRAIN of the system:
+    - Detects canton/commune from query
+    - Identifies legal domain
+    - Creates tailored queries for each agent
+    """
+    question = state["question"]
+    
+    # 1. Detect geographic context
+    canton = detect_canton(question)
+    canton_name = ""
+    if canton:
+        canton_info = CANTON_NAMES.get(canton, {})
+        canton_name = canton_info.get("de", canton)
+    
+    commune = detect_commune(question)
+    
+    # 2. Detect legal domain (simple keyword matching)
+    question_lower = question.lower()
+    legal_domain = "Allgemein"
+    
+    domain_keywords = {
+        "Baurecht": ["zaun", "einfriedung", "bauen", "grenzabstand", "baugesetz", "höhe", "mauer", "hecke"],
+        "Mietrecht": ["miete", "kündigung", "mietvertrag", "vermieter", "mieter", "nebenkosten", "kaution"],
+        "Arbeitsrecht": ["arbeit", "lohn", "ferien", "kündigung", "arbeitsvertrag", "überstunden"],
+        "Nachbarrecht": ["nachbar", "immissionen", "lärm", "grenze", "schatten"],
+        "Familienrecht": ["scheidung", "unterhalt", "sorgerecht", "ehe", "kind"],
+        "Vertragsrecht": ["vertrag", "schadenersatz", "haftung", "schuld"],
+    }
+    
+    for domain, keywords in domain_keywords.items():
+        if any(kw in question_lower for kw in keywords):
+            legal_domain = domain
+            break
+    
+    # 3. Create enriched queries for each agent
+    enriched_queries = {}
+    
+    # Primary Law Query - focus on federal law
+    if canton:
+        # If cantonal question, primary law might still be relevant (e.g., ZGB Nachbarrecht)
+        enriched_queries["primary_law"] = f"{question} Bundesrecht ZGB OR"
+    else:
+        enriched_queries["primary_law"] = question
+    
+    # Cantonal Law Query - only if canton detected
+    if canton:
+        # Add specific legal terms based on domain
+        domain_terms = {
+            "Baurecht": "Baugesetz Bauverordnung Einfriedung Grenzabstand",
+            "Mietrecht": "Mietrecht VMWG",
+            "Nachbarrecht": "Nachbarrecht Einfriedung",
+        }
+        extra_terms = domain_terms.get(legal_domain, "")
+        enriched_queries["cantonal_law"] = f"{question} {extra_terms}"
+        
+        # Generate specific search queries for cantonal search
+        enriched_queries["cantonal_search_queries"] = [
+            f'"{canton_name}" {legal_domain} Gesetz',
+            f'site:lexfind.ch "{canton_name}" {question}',
+            f'Merkblatt "{canton_name}" {extra_terms}',
+        ]
+    
+    # Case Law Query - add BGE and relevant terms
+    case_law_terms = {
+        "Baurecht": "Grenzabstand Baute BGE",
+        "Nachbarrecht": "Immissionen Einfriedung BGE",
+        "Mietrecht": "Kündigung Mietzins BGE",
+    }
+    extra_case_terms = case_law_terms.get(legal_domain, "BGE")
+    enriched_queries["case_law"] = f"{question} {extra_case_terms}"
+    
+    # Log what we detected
+    print(f"\n🎯 ORCHESTRATOR ANALYSIS:")
+    print(f"   Question: {question[:80]}...")
+    print(f"   Canton: {canton} ({canton_name})" if canton else "   Canton: None (Bundesrecht)")
+    print(f"   Commune: {commune}" if commune else "   Commune: None")
+    print(f"   Legal Domain: {legal_domain}")
+    print(f"   Enriched Queries: {list(enriched_queries.keys())}")
+    
+    return {
+        **state,
+        "detected_canton": canton or "",
+        "detected_canton_name": canton_name,
+        "detected_commune": commune or "",
+        "legal_domain": legal_domain,
+        "enriched_queries": enriched_queries,
+        "current_stage": "analyzed"
+    }
 
-Based on the search results below, provide a structured summary of relevant primary law.
-If the search results are insufficient, clearly state what's missing.
 
-SEARCH RESULTS:
-{search_results}
+# ============================================================
+# PARALLEL SEARCH AGENTS
+# ============================================================
 
-USER QUESTION:
-{question}
+def run_parallel_search(state: ResearchState) -> ResearchState:
+    """
+    Execute all relevant searches in PARALLEL.
+    
+    This is much faster than sequential execution!
+    """
+    enriched = state.get("enriched_queries", {})
+    canton = state.get("detected_canton", "")
+    canton_name = state.get("detected_canton_name", "")
+    commune = state.get("detected_commune", "")
+    
+    results = {
+        "primary_law": "",
+        "cantonal_law": "",
+        "case_law": ""
+    }
+    errors = state.get("errors", [])
+    
+    def search_primary():
+        """Search federal law"""
+        try:
+            query = enriched.get("primary_law", state["question"])
+            return search_swiss_primary_law(query, max_results=5)
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def search_cantonal():
+        """Search cantonal law (only if canton detected)"""
+        if not canton:
+            return "Kein Kanton erkannt - kantonale Suche übersprungen."
+        try:
+            query = enriched.get("cantonal_law", state["question"])
+            orchestrator_queries = enriched.get("cantonal_search_queries", [])
+            return search_cantonal_law(
+                query=query,
+                canton=canton,
+                canton_name=canton_name,
+                orchestrator_queries=orchestrator_queries,
+                max_results=5,
+                commune=commune
+            )
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def search_case_law():
+        """Search BGE decisions"""
+        try:
+            query = enriched.get("case_law", state["question"])
+            return search_swiss_case_law(query, max_results=5)
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    # Execute ALL searches in parallel!
+    print(f"\n🔄 PARALLEL SEARCH: Starting 3 agents...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_primary = executor.submit(search_primary)
+        future_cantonal = executor.submit(search_cantonal)
+        future_case = executor.submit(search_case_law)
+        
+        # Collect results
+        results["primary_law"] = future_primary.result()
+        results["cantonal_law"] = future_cantonal.result()
+        results["case_law"] = future_case.result()
+    
+    print(f"✅ PARALLEL SEARCH: All agents complete!")
+    print(f"   Primary Law: {len(results['primary_law'])} chars")
+    print(f"   Cantonal Law: {len(results['cantonal_law'])} chars")
+    print(f"   Case Law: {len(results['case_law'])} chars")
+    
+    return {
+        **state,
+        "primary_law_results": results["primary_law"],
+        "cantonal_law_results": results["cantonal_law"],
+        "case_law_results": results["case_law"],
+        "current_stage": "search_complete",
+        "errors": errors
+    }
 
-Respond in the same language as the question (German/French/Italian/English)."""
 
+# ============================================================
+# ANALYSIS AGENT
+# ============================================================
 
-CASE_LAW_PROMPT = """You are a Swiss case law specialist. Your role is to:
-1. Analyze search results from Swiss Federal Court (Bundesgericht) decisions
-2. Identify relevant BGE decisions and their key holdings
-3. Cite precisely: BGE [volume] [section] [page] (year)
-4. NEVER invent or hallucinate case references
+ANALYSIS_PROMPT = """Du bist ein Schweizer Rechtsexperte. Deine Aufgabe ist es, die Rechercheergebnisse zu einer präzisen rechtlichen Analyse zusammenzufassen.
 
-Based on the search results below, provide a structured summary of relevant case law.
-If the search results are insufficient, clearly state what's missing.
+WICHTIGE REGELN:
+1. Zitiere ALLE Quellen präzise (Art. X Abs. Y Gesetz, BGE X II Y)
+2. Unterscheide klar zwischen Bundesrecht und kantonalem Recht
+3. Wenn ein Kanton erkannt wurde, priorisiere kantonales Recht für lokale Fragen
+4. Gib konkrete Antworten mit Zahlen/Massen wenn vorhanden
+5. Weise auf Unsicherheiten oder fehlende Informationen hin
 
-SEARCH RESULTS:
-{search_results}
+KONTEXT:
+- Erkannter Kanton: {canton} {canton_name}
+- Erkannte Gemeinde: {commune}
+- Rechtsgebiet: {legal_domain}
 
-USER QUESTION:
-{question}
-
-Respond in the same language as the question."""
-
-
-ANALYSIS_PROMPT = """You are a Swiss legal analyst. Your role is to:
-1. Synthesize primary law and case law research into a comprehensive analysis
-2. Apply the law to any user document or specific situation
-3. Identify legal risks, uncertainties, and open questions
-4. Provide practical recommendations where appropriate
-
-IMPORTANT GUIDELINES:
-- Cite all sources precisely (Art., BGE references)
-- Clearly distinguish between established law and interpretation
-- Note any gaps in the research or areas needing further investigation
-- If analyzing a document, identify specific clauses and their legal implications
-
-PRIMARY LAW FINDINGS:
+BUNDESRECHT (Fedlex):
 {primary_law}
 
-CASE LAW FINDINGS:
+KANTONALES RECHT:
+{cantonal_law}
+
+RECHTSPRECHUNG (BGE):
 {case_law}
 
-USER QUESTION:
+FRAGE:
 {question}
 
 {document_section}
 
-Provide a structured legal analysis in the same language as the question."""
-
-
-def run_primary_law_agent(state: ResearchState) -> ResearchState:
-    """Agent that searches and analyzes Swiss primary law"""
-    llm = get_llm()
-    
-    try:
-        # Perform search
-        search_results = search_swiss_primary_law(state["question"])
-        
-        # Analyze results
-        prompt = ChatPromptTemplate.from_template(PRIMARY_LAW_PROMPT)
-        response = llm.invoke(prompt.format(
-            search_results=search_results,
-            question=state["question"]
-        ))
-        
-        return {
-            **state,
-            "primary_law_results": response.content,
-            "current_stage": "primary_law_complete"
-        }
-    except Exception as e:
-        return {
-            **state,
-            "primary_law_results": f"Error in primary law search: {str(e)}",
-            "errors": state.get("errors", []) + [str(e)]
-        }
-
-
-def run_case_law_agent(state: ResearchState) -> ResearchState:
-    """Agent that searches and analyzes Swiss case law"""
-    llm = get_llm()
-    
-    try:
-        # Perform search
-        search_results = search_swiss_case_law(state["question"])
-        
-        # Analyze results
-        prompt = ChatPromptTemplate.from_template(CASE_LAW_PROMPT)
-        response = llm.invoke(prompt.format(
-            search_results=search_results,
-            question=state["question"]
-        ))
-        
-        return {
-            **state,
-            "case_law_results": response.content,
-            "current_stage": "case_law_complete"
-        }
-    except Exception as e:
-        return {
-            **state,
-            "case_law_results": f"Error in case law search: {str(e)}",
-            "errors": state.get("errors", []) + [str(e)]
-        }
+Antworte strukturiert in der Sprache der Frage:
+1. KURZE ANTWORT (1-2 Sätze mit konkreter Antwort)
+2. RECHTSGRUNDLAGE (relevante Artikel mit Zitaten)
+3. DETAILS (weitere relevante Informationen)
+4. QUELLEN (alle verwendeten Quellen auflisten)"""
 
 
 def run_analysis_agent(state: ResearchState) -> ResearchState:
-    """Agent that synthesizes research into final analysis"""
+    """Agent that synthesizes all research into final analysis"""
     llm = get_llm()
     
     try:
         # Prepare document section if present
         document_section = ""
         if state.get("document"):
-            document_section = f"USER DOCUMENT TO ANALYZE:\n{state['document']}"
+            document_section = f"DOKUMENT ZUR ANALYSE:\n{state['document']}"
         
         # Generate analysis
         prompt = ChatPromptTemplate.from_template(ANALYSIS_PROMPT)
         response = llm.invoke(prompt.format(
-            primary_law=state.get("primary_law_results", "No primary law research available"),
-            case_law=state.get("case_law_results", "No case law research available"),
+            canton=state.get("detected_canton", "Keiner"),
+            canton_name=f"({state.get('detected_canton_name', '')})" if state.get("detected_canton_name") else "",
+            commune=state.get("detected_commune", "Keine"),
+            legal_domain=state.get("legal_domain", "Allgemein"),
+            primary_law=state.get("primary_law_results", "Keine Ergebnisse"),
+            cantonal_law=state.get("cantonal_law_results", "Keine Ergebnisse"),
+            case_law=state.get("case_law_results", "Keine Ergebnisse"),
             question=state["question"],
             document_section=document_section
         ))
@@ -220,24 +342,28 @@ def run_analysis_agent(state: ResearchState) -> ResearchState:
 # ============================================================
 
 def create_research_graph():
-    """Create the LangGraph workflow for legal research"""
+    """
+    Create the LangGraph workflow for legal research.
     
-    # Initialize graph with state schema
+    Flow:
+    1. ORCHESTRATOR_ANALYZE: Detect context, enrich queries
+    2. PARALLEL_SEARCH: Run all search agents simultaneously
+    3. ANALYSIS: Synthesize results into final answer
+    """
+    
     workflow = StateGraph(ResearchState)
     
-    # Add nodes (agents)
-    workflow.add_node("primary_law", run_primary_law_agent)
-    workflow.add_node("case_law", run_case_law_agent)
+    # Add nodes
+    workflow.add_node("orchestrator_analyze", run_orchestrator_analyze)
+    workflow.add_node("parallel_search", run_parallel_search)
     workflow.add_node("analysis", run_analysis_agent)
     
-    # Define edges (workflow)
-    # Start with primary law, then case law, then analysis
-    workflow.set_entry_point("primary_law")
-    workflow.add_edge("primary_law", "case_law")
-    workflow.add_edge("case_law", "analysis")
+    # Define flow: analyze → search (parallel) → analyze
+    workflow.set_entry_point("orchestrator_analyze")
+    workflow.add_edge("orchestrator_analyze", "parallel_search")
+    workflow.add_edge("parallel_search", "analysis")
     workflow.add_edge("analysis", END)
     
-    # Compile the graph
     return workflow.compile()
 
 
@@ -270,7 +396,13 @@ def run_legal_research(question: str, document: str = "") -> dict:
     initial_state: ResearchState = {
         "question": question,
         "document": document,
+        "detected_canton": "",
+        "detected_canton_name": "",
+        "detected_commune": "",
+        "legal_domain": "",
+        "enriched_queries": {},
         "primary_law_results": "",
+        "cantonal_law_results": "",
         "case_law_results": "",
         "final_analysis": "",
         "current_stage": "started",
@@ -283,7 +415,11 @@ def run_legal_research(question: str, document: str = "") -> dict:
     return {
         "question": question,
         "has_document": bool(document),
+        "detected_canton": final_state.get("detected_canton", ""),
+        "detected_canton_name": final_state.get("detected_canton_name", ""),
+        "legal_domain": final_state.get("legal_domain", ""),
         "primary_law": final_state.get("primary_law_results", ""),
+        "cantonal_law": final_state.get("cantonal_law_results", ""),
         "case_law": final_state.get("case_law_results", ""),
         "analysis": final_state.get("final_analysis", ""),
         "errors": final_state.get("errors", [])
@@ -292,8 +428,13 @@ def run_legal_research(question: str, document: str = "") -> dict:
 
 if __name__ == "__main__":
     # Test the graph
-    print("Testing LangGraph Research Pipeline...")
-    result = run_legal_research("Was sind die Kündigungsfristen im Schweizer Arbeitsrecht?")
-    print("\n" + "=" * 60)
+    print("=" * 70)
+    print("Testing Smart Orchestrator Pipeline...")
+    print("=" * 70)
+    
+    # Test 1: Cantonal question
+    result = run_legal_research("Wie hoch darf ein Zaun in Appenzell sein?")
+    print("\n" + "=" * 70)
     print("FINAL ANALYSIS:")
+    print("=" * 70)
     print(result["analysis"])

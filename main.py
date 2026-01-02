@@ -17,13 +17,17 @@ import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-env_path = Path(__file__).parent / ".env"
+# Load environment variables from keys.env file
+env_path = Path(__file__).parent / "keys.env"
 if env_path.exists():
     load_dotenv(env_path)
 else:
-    # Try loading from current directory
-    load_dotenv()
+    # Fallback to .env
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        load_dotenv()
 
 
 def print_banner():

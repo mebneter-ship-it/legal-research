@@ -20,11 +20,39 @@ from typing import Generator, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
+import re
 
 # Load environment variables
-load_dotenv()
+load_dotenv("keys.env")
+
+def make_links_open_in_new_tab(text: str) -> str:
+    """Convert markdown links to HTML links that open in new tab"""
+    # Pattern for markdown links: [text](url)
+    markdown_link_pattern = r'\[([^\]]+)\]\((https?://[^\)]+)\)'
+    
+    def replace_link(match):
+        link_text = match.group(1)
+        url = match.group(2)
+        return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{link_text}</a>'
+    
+    # Replace markdown links with HTML
+    result = re.sub(markdown_link_pattern, replace_link, text)
+    
+    # Also handle bare URLs that aren't already in markdown link format
+    # Match URLs not preceded by ]( or href="
+    bare_url_pattern = r'(?<!\]\()(?<!href=")(https?://[^\s\)<>\]]+)'
+    
+    def replace_bare_url(match):
+        url = match.group(1)
+        # Don't replace if it's already part of an HTML tag
+        return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a>'
+    
+    result = re.sub(bare_url_pattern, replace_bare_url, result)
+    
+    return result
 
 # Fix API key prefixes
 def fix_api_keys():
@@ -46,19 +74,11 @@ from tools import (
     search_cantonal_case_law,
     search_communal_law
 )
+from smart_search import SmartLegalSearch, search_cantonal, search_federal, search_case_law
 from prompts import (
-    PRIMARY_LAW_SYSTEM_PROMPT,
-    PRIMARY_LAW_USER_PROMPT,
-    CASE_LAW_SYSTEM_PROMPT,
-    CASE_LAW_USER_PROMPT,
-    CANTONAL_LAW_SYSTEM_PROMPT,
-    CANTONAL_LAW_USER_PROMPT,
     ANALYSIS_SYSTEM_PROMPT,
     ANALYSIS_USER_PROMPT,
-    get_primary_law_prompt,
-    get_case_law_prompt,
-    get_cantonal_law_prompt,
-    get_analysis_prompt
+    get_analysis_prompt  # Only need this one now - agents pass raw results to Claude
 )
 
 
@@ -260,6 +280,8 @@ class AgentState:
     logs: list = field(default_factory=list)
     search_query: str = ""
     search_results: str = ""
+    planned_queries: list = field(default_factory=list)  # NEW: What the agent decided to search
+    planning_duration_ms: float = 0  # NEW: How long planning took
     # Separate system and user prompts for visibility
     system_prompt: str = ""
     user_prompt: str = ""
@@ -323,9 +345,18 @@ class ResearchSession:
     
     # Legal context from orchestrator
     legal_domain: str = ""  # Specific domain: Mietrecht, Arbeitsrecht, etc.
+    related_domains: list = field(default_factory=list)  # Related domains to also search
     legal_context: str = ""  # Brief explanation of the issue
     relevant_articles: list = field(default_factory=list)  # Articles that ARE relevant
     irrelevant_articles: list = field(default_factory=list)  # Articles to AVOID (wrong domain)
+    
+    # Enhanced context for agents (NEW!)
+    key_terms: list = field(default_factory=list)  # Key search terms
+    synonyms: dict = field(default_factory=dict)  # Alternative terms
+    search_hints: dict = field(default_factory=dict)  # Hints per agent type
+    
+    # Document analysis from orchestrator (new!)
+    document_analysis: dict = field(default_factory=dict)  # Structured analysis of uploaded document
     
     search_topics: list = field(default_factory=list)  # Legacy: Topics to search for
     search_queries: dict = field(default_factory=dict)  # New: Specific queries per agent
@@ -337,6 +368,7 @@ class ResearchSession:
     primary_law_agent: AgentState = field(default_factory=lambda: AgentState(name="Primary Law Agent"))
     case_law_agent: AgentState = field(default_factory=lambda: AgentState(name="Case Law Agent"))
     cantonal_law_agent: AgentState = field(default_factory=lambda: AgentState(name="Cantonal Law Agent"))
+    cantonal_case_law_agent: AgentState = field(default_factory=lambda: AgentState(name="Cantonal Case Law Agent"))
     analysis_agent: AgentState = field(default_factory=lambda: AgentState(name="Analysis Agent"))
     
     final_output: str = ""
@@ -347,24 +379,55 @@ class ResearchSession:
 # LLM CONFIGURATION
 # ============================================================
 
-def get_llm():
-    """Get configured LLM"""
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+def get_llm(role: str = "agent"):
+    """
+    Get configured LLM based on role.
     
-    if provider == "anthropic":
+    Roles:
+    - "orchestrator": Uses GPT-4o for critical legal domain detection
+    - "analysis": Uses Claude Sonnet (if available) OR GPT-4o for synthesis
+    - "agent": Uses GPT-4o-mini for search agents
+    
+    Hybrid Mode (default when both API keys present):
+    - Orchestrator: GPT-4o (fast, good at structured output)
+    - Search Agents: GPT-4o-mini (cheap, has context)
+    - Analysis: Claude Sonnet (best reasoning for legal synthesis)
+    """
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    use_claude_for_analysis = os.getenv("USE_CLAUDE_FOR_ANALYSIS", "true").lower() == "true"
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    
+    # Option A: Claude for Analysis (if key available and enabled)
+    if role == "analysis" and use_claude_for_analysis and anthropic_key:
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.1), "claude-sonnet-4-20250514"
+        return ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.1), "claude-sonnet-4"
+    
+    # Full Anthropic mode
+    if provider == "anthropic" and anthropic_key:
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.1), "claude-sonnet-4"
+    
+    # Default: OpenAI
+    from langchain_openai import ChatOpenAI
+    if role in ["orchestrator", "analysis"]:
+        # Stronger model for critical decisions
+        return ChatOpenAI(model="gpt-4o", temperature=0.1), "gpt-4o"
     else:
-        from langchain_openai import ChatOpenAI
+        # Faster/cheaper model for search agents
         return ChatOpenAI(model="gpt-4o-mini", temperature=0.1), "gpt-4o-mini"
+
+
+def get_llm_simple():
+    """Get default LLM (for backward compatibility)"""
+    return get_llm("agent")
 
 
 def run_benchmark_direct(question: str, language: str = "German") -> str:
     """
     Run direct LLM query WITHOUT agents for comparison.
-    Uses the EXACT same question and output format to ensure fair comparison.
+    Uses the SAME strong model (gpt-4o) as Analysis Agent for fair comparison.
     """
-    llm, _ = get_llm()
+    llm, model_name = get_llm("analysis")  # Use same model as Analysis Agent for fair comparison
     
     # Language-specific headers for fair comparison
     headers = {
@@ -393,6 +456,410 @@ Struktur:
 
 
 # ============================================================
+# PARALLEL AGENT EXECUTION HELPERS
+# ============================================================
+
+def run_primary_law_agent_work(session: 'ResearchSession') -> dict:
+    """
+    Run Primary Law Agent work - AGENTIC VERSION
+    
+    The agent DECIDES ITSELF what to search based on:
+    1. The question
+    2. Context from orchestrator (legal domain, relevant articles)
+    
+    Flow:
+    1. PLAN: LLM decides what searches to do
+    2. EXECUTE: Run the planned searches
+    3. ANALYZE: LLM analyzes results
+    """
+    from prompts import PRIMARY_LAW_PLANNING_PROMPT, parse_search_queries
+    
+    start_time = time.time()
+    result = {
+        "agent": "primary_law",
+        "search_results": "",
+        "llm_response": "",
+        "system_prompt": "",
+        "user_prompt": "",
+        "search_query": "",
+        "planned_queries": [],  # NEW: What the agent decided to search
+        "error": None,
+        "search_duration_ms": 0,
+        "llm_duration_ms": 0,
+        "planning_duration_ms": 0,
+        "total_duration_ms": 0
+    }
+    
+    try:
+        agent_llm, _ = get_llm("agent")
+        
+        # ========== STEP 1: PLANNING ==========
+        planning_start = time.time()
+        
+        # Format related_domains for display
+        related_domains_str = ", ".join(session.related_domains) if session.related_domains else "Keine"
+        search_hint = (session.search_hints or {}).get("primary_law", "")
+        
+        planning_prompt = PRIMARY_LAW_PLANNING_PROMPT.format(
+            question=session.question,
+            legal_domain=session.legal_domain or "Nicht spezifiziert",
+            related_domains=related_domains_str,
+            relevant_articles=", ".join(session.relevant_articles) if session.relevant_articles else "Keine",
+            key_terms=", ".join(session.key_terms) if session.key_terms else "Keine",
+            search_hint=search_hint
+        )
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        planning_response = agent_llm.invoke([
+            HumanMessage(content=planning_prompt)
+        ])
+        
+        # Parse the search queries from LLM response
+        planned_queries = parse_search_queries(planning_response.content)
+        result["planned_queries"] = planned_queries
+        result["planning_duration_ms"] = (time.time() - planning_start) * 1000
+        
+        # Fallback if parsing failed
+        if not planned_queries:
+            planned_queries = [session.question]
+        
+        result["search_query"] = " | ".join(planned_queries)
+        
+        # ========== STEP 2: EXECUTE SEARCHES ==========
+        search_start = time.time()
+        all_results = []
+        
+        for query in planned_queries:
+            try:
+                search_result = search_swiss_primary_law(query, max_results=5)
+                if search_result and len(search_result) > 100:
+                    all_results.append(f"### Query: {query}\n{search_result}")
+            except Exception as e:
+                all_results.append(f"### Query: {query}\nError: {str(e)}")
+        
+        result["search_results"] = "\n\n---\n\n".join(all_results) if all_results else "Keine Ergebnisse gefunden"
+        result["search_duration_ms"] = (time.time() - search_start) * 1000
+        
+        # Store planning prompt for UI visibility
+        result["user_prompt"] = f"PLANNING PROMPT:\n{planning_prompt}\n\nAGENT RESPONSE:\n{planning_response.content}"
+        
+        # NO STEP 3! Raw results go directly to Analysis Agent (Claude)
+        result["llm_response"] = result["search_results"]  # Pass raw results
+        result["llm_duration_ms"] = 0
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    result["total_duration_ms"] = (time.time() - start_time) * 1000
+    return result
+
+
+def run_case_law_agent_work(session: 'ResearchSession') -> dict:
+    """
+    Run Case Law Agent work - AGENTIC VERSION
+    
+    The agent DECIDES ITSELF what BGE/case law to search based on:
+    1. The question
+    2. Context from orchestrator (legal domain, relevant articles)
+    
+    Flow:
+    1. PLAN: LLM decides what case law searches to do
+    2. EXECUTE: Run the planned searches
+    3. ANALYZE: LLM analyzes results
+    """
+    from prompts import CASE_LAW_PLANNING_PROMPT, parse_search_queries
+    
+    start_time = time.time()
+    result = {
+        "agent": "case_law",
+        "search_results": "",
+        "llm_response": "",
+        "system_prompt": "",
+        "user_prompt": "",
+        "search_query": "",
+        "planned_queries": [],
+        "error": None,
+        "search_duration_ms": 0,
+        "llm_duration_ms": 0,
+        "planning_duration_ms": 0,
+        "total_duration_ms": 0
+    }
+    
+    try:
+        agent_llm, _ = get_llm("agent")
+        
+        # ========== STEP 1: PLANNING ==========
+        planning_start = time.time()
+        
+        # Format related_domains for display
+        related_domains_str = ", ".join(session.related_domains) if session.related_domains else "Keine"
+        search_hint = (session.search_hints or {}).get("case_law", "")
+        
+        planning_prompt = CASE_LAW_PLANNING_PROMPT.format(
+            question=session.question,
+            legal_domain=session.legal_domain or "Nicht spezifiziert",
+            related_domains=related_domains_str,
+            relevant_articles=", ".join(session.relevant_articles) if session.relevant_articles else "Keine",
+            key_terms=", ".join(session.key_terms) if session.key_terms else "Keine",
+            search_hint=search_hint
+        )
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        planning_response = agent_llm.invoke([
+            HumanMessage(content=planning_prompt)
+        ])
+        
+        planned_queries = parse_search_queries(planning_response.content)
+        result["planned_queries"] = planned_queries
+        result["planning_duration_ms"] = (time.time() - planning_start) * 1000
+        
+        if not planned_queries:
+            planned_queries = [f"BGE {session.question}"]
+        
+        result["search_query"] = " | ".join(planned_queries)
+        
+        # ========== STEP 2: EXECUTE SEARCHES ==========
+        search_start = time.time()
+        all_results = []
+        
+        for query in planned_queries:
+            try:
+                search_result = search_swiss_case_law(query, max_results=5)
+                if search_result and len(search_result) > 100:
+                    all_results.append(f"### Query: {query}\n{search_result}")
+            except Exception as e:
+                all_results.append(f"### Query: {query}\nError: {str(e)}")
+        
+        result["search_results"] = "\n\n---\n\n".join(all_results) if all_results else "Keine Ergebnisse gefunden"
+        result["search_duration_ms"] = (time.time() - search_start) * 1000
+        
+        # Store planning prompt for UI visibility
+        result["user_prompt"] = f"PLANNING PROMPT:\n{planning_prompt}\n\nAGENT RESPONSE:\n{planning_response.content}"
+        
+        # NO STEP 3! Raw results go directly to Analysis Agent (Claude)
+        result["llm_response"] = result["search_results"]
+        result["llm_duration_ms"] = 0
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    result["total_duration_ms"] = (time.time() - start_time) * 1000
+    return result
+
+
+def run_cantonal_law_agent_work(session: 'ResearchSession') -> dict:
+    """
+    Run Cantonal Law Agent work - AGENTIC VERSION
+    
+    The agent DECIDES ITSELF what cantonal laws to search based on:
+    1. The question
+    2. The canton/commune
+    3. Context from orchestrator (legal domain)
+    
+    Flow:
+    1. PLAN: LLM decides what cantonal law searches to do
+    2. EXECUTE: Run the planned searches
+    3. ANALYZE: LLM analyzes results
+    """
+    from prompts import CANTONAL_LAW_PLANNING_PROMPT, parse_search_queries
+    
+    start_time = time.time()
+    result = {
+        "agent": "cantonal_law",
+        "search_results": "",
+        "llm_response": "",
+        "system_prompt": "",
+        "user_prompt": "",
+        "search_query": "",
+        "planned_queries": [],
+        "error": None,
+        "search_duration_ms": 0,
+        "llm_duration_ms": 0,
+        "planning_duration_ms": 0,
+        "total_duration_ms": 0
+    }
+    
+    if not session.canton:
+        result["error"] = "No canton specified"
+        return result
+    
+    try:
+        agent_llm, _ = get_llm("agent")
+        canton_display = session.canton_name.get("de", session.canton) if session.canton_name else session.canton
+        
+        # Canton domain mapping
+        canton_domains = {
+            "AI": "ai.clex.ch", "AR": "ar.clex.ch", "ZH": "zh.clex.ch",
+            "BE": "be.clex.ch", "BS": "bs.clex.ch", "BL": "bl.clex.ch",
+            "LU": "lu.clex.ch", "SG": "sg.clex.ch", "AG": "ag.clex.ch",
+            "TG": "tg.clex.ch", "GR": "gr.clex.ch", "VS": "vs.clex.ch",
+            "TI": "ti.clex.ch", "VD": "vd.clex.ch", "GE": "ge.clex.ch",
+            "NE": "ne.clex.ch", "JU": "ju.clex.ch", "FR": "fr.clex.ch",
+            "SO": "so.clex.ch", "SH": "sh.clex.ch", "ZG": "zg.clex.ch",
+            "SZ": "sz.clex.ch", "OW": "ow.clex.ch", "NW": "nw.clex.ch",
+            "GL": "gl.clex.ch", "UR": "ur.clex.ch"
+        }
+        canton_domain = canton_domains.get(session.canton, f"{session.canton.lower()}.clex.ch")
+        
+        # ========== STEP 1: PLANNING ==========
+        planning_start = time.time()
+        
+        search_hint = (session.search_hints or {}).get("cantonal_law", "")
+        
+        planning_prompt = CANTONAL_LAW_PLANNING_PROMPT.format(
+            question=session.question,
+            canton=session.canton,
+            canton_name=canton_display,
+            commune=session.commune or "Nicht spezifiziert",
+            canton_domain=canton_domain,
+            legal_domain=session.legal_domain or "Nicht spezifiziert",
+            key_terms=", ".join(session.key_terms) if session.key_terms else "Keine",
+            search_hint=search_hint
+        )
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        planning_response = agent_llm.invoke([
+            HumanMessage(content=planning_prompt)
+        ])
+        
+        planned_queries = parse_search_queries(planning_response.content)
+        result["planned_queries"] = planned_queries
+        result["planning_duration_ms"] = (time.time() - planning_start) * 1000
+        
+        if not planned_queries:
+            planned_queries = [f"site:{canton_domain} {session.question}"]
+        
+        result["search_query"] = " | ".join(planned_queries)
+        
+        # ========== STEP 2: EXECUTE SEARCHES using Smart Search from tools.py ==========
+        search_start = time.time()
+        
+        # Use the comprehensive search_cantonal_law function from tools.py
+        # It has: include_raw_content, Merkblatt detection, PDF extraction, relevance scoring
+        search_results = search_cantonal_law(
+            query=session.question,
+            canton=session.canton,
+            canton_name=canton_display,
+            orchestrator_queries=planned_queries,  # Pass agent-planned queries
+            max_results=5,
+            commune=session.commune
+        )
+        
+        result["search_results"] = search_results
+        result["search_duration_ms"] = (time.time() - search_start) * 1000
+        
+        # Store planning prompt for UI visibility
+        result["user_prompt"] = f"PLANNING PROMPT:\n{planning_prompt}\n\nAGENT RESPONSE:\n{planning_response.content}"
+        
+        # NO STEP 3! Raw results go directly to Analysis Agent (Claude)
+        result["llm_response"] = result["search_results"]
+        result["llm_duration_ms"] = 0
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    result["total_duration_ms"] = (time.time() - start_time) * 1000
+    return result
+
+
+def run_cantonal_case_law_agent_work(session: 'ResearchSession') -> dict:
+    """
+    Run Cantonal Case Law Agent work - AGENTIC VERSION
+    
+    The agent DECIDES ITSELF what cantonal case law to search based on:
+    1. The question
+    2. The canton
+    3. Context from orchestrator (legal domain)
+    
+    Flow:
+    1. PLAN: LLM decides what cantonal case law searches to do
+    2. EXECUTE: Run the planned searches
+    3. ANALYZE: LLM analyzes results
+    """
+    from prompts import CANTONAL_CASE_LAW_PLANNING_PROMPT, parse_search_queries
+    
+    start_time = time.time()
+    result = {
+        "agent": "cantonal_case_law",
+        "search_results": "",
+        "llm_response": "",
+        "system_prompt": "",
+        "user_prompt": "",
+        "search_query": "",
+        "planned_queries": [],
+        "error": None,
+        "search_duration_ms": 0,
+        "llm_duration_ms": 0,
+        "planning_duration_ms": 0,
+        "total_duration_ms": 0
+    }
+    
+    if not session.canton:
+        result["error"] = "No canton specified"
+        return result
+    
+    try:
+        agent_llm, _ = get_llm("agent")
+        canton_display = session.canton_name.get("de", session.canton) if session.canton_name else session.canton
+        
+        # ========== STEP 1: PLANNING ==========
+        planning_start = time.time()
+        
+        search_hint = (session.search_hints or {}).get("cantonal_law", "")
+        
+        planning_prompt = CANTONAL_CASE_LAW_PLANNING_PROMPT.format(
+            question=session.question,
+            canton=session.canton,
+            canton_name=canton_display,
+            legal_domain=session.legal_domain or "Nicht spezifiziert",
+            key_terms=", ".join(session.key_terms) if session.key_terms else "Keine",
+            search_hint=search_hint
+        )
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        planning_response = agent_llm.invoke([
+            HumanMessage(content=planning_prompt)
+        ])
+        
+        planned_queries = parse_search_queries(planning_response.content)
+        result["planned_queries"] = planned_queries
+        result["planning_duration_ms"] = (time.time() - planning_start) * 1000
+        
+        if not planned_queries:
+            planned_queries = [f"site:entscheidsuche.ch {canton_display} {session.question}"]
+        
+        result["search_query"] = " | ".join(planned_queries)
+        
+        # ========== STEP 2: EXECUTE SEARCHES ==========
+        search_start = time.time()
+        
+        # Use the comprehensive search_cantonal_case_law function from tools.py
+        search_results = search_cantonal_case_law(
+            query=session.question,
+            canton=session.canton,
+            canton_name=canton_display,
+            orchestrator_queries=planned_queries,  # Pass agent-planned queries
+            max_results=5
+        )
+        
+        result["search_results"] = search_results
+        result["search_duration_ms"] = (time.time() - search_start) * 1000
+        
+        # Store planning prompt for UI visibility
+        result["user_prompt"] = f"PLANNING PROMPT:\n{planning_prompt}\n\nAGENT RESPONSE:\n{planning_response.content}"
+        
+        # NO STEP 3! Raw results go directly to Analysis Agent (Claude)
+        result["llm_response"] = result["search_results"]
+        result["llm_duration_ms"] = 0
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    result["total_duration_ms"] = (time.time() - start_time) * 1000
+    return result
+
+
+# ============================================================
 # INSTRUMENTED RESEARCH PIPELINE
 # ============================================================
 
@@ -404,155 +871,154 @@ def run_research_pipeline(session: ResearchSession) -> Generator[ResearchSession
     from langchain_core.prompts import ChatPromptTemplate
     import json
     
-    llm, model_name = get_llm()
+    # Get orchestrator LLM (stronger model)
+    llm, model_name = get_llm("orchestrator")
     pipeline_start = time.time()
     
     # ========== ORCHESTRATOR: LLM-BASED ANALYSIS ==========
     session.orchestrator.status = AgentStatus.RUNNING
     session.orchestrator.current_step = "Analyzing question"
     session.orchestrator.add_log("Analyzing question with LLM...", "start")
+    session.orchestrator.add_log(f"Using model: {model_name}", "config")
     yield session
     
     # Let the LLM analyze the question
-    orchestrator_prompt = """You are the orchestrator for a Swiss legal research system. Analyze this question and plan the research.
+    # Build orchestrator prompt with optional document context
+    doc_context_for_orchestrator = ""
+    doc_analysis_instruction = ""
+    if session.document_text:
+        doc_context_for_orchestrator = f"\n\nDOCUMENT TO ANALYZE:\n\"\"\"\n{session.document_text[:3000]}\n\"\"\"\n"
+        doc_analysis_instruction = """
+6. ANALYZE THE DOCUMENT and extract key facts:
+   - Document type (contract type, letter, etc.)
+   - Parties involved
+   - Key dates, amounts, obligations
+   - The specific problem/issue
+   - Legal questions that arise
+"""
+    
+    orchestrator_prompt = """Du bist ein erfahrener SCHWEIZER RECHTSRECHERCHE-SPEZIALIST.
 
-QUESTION: {question}
+Deine Aufgabe: Analysiere die Rechtsfrage und liefere optimalen Kontext für die Such-Agents. 
+Die Qualität der Recherche hängt direkt von deiner Analyse ab!
 
-YOUR TASKS:
-1. Detect the language of the question
-2. Identify if a specific Swiss canton is mentioned
-3. Identify the SPECIFIC legal domain (Rechtsgebiet)
-4. List the RELEVANT articles for this domain
-5. Generate search queries
+FRAGE: {question}
+{document_context}
 
+ANALYSE-AUFGABEN:
+1. Sprache erkennen
+2. Kanton/Gemeinde identifizieren (Schweizer Geographie)
+3. Rechtsgebiet präzise bestimmen
+4. Relevante Gesetzesartikel auflisten
+5. Schlüsselbegriffe für die Suche - denke wie ein Jurist:
+   - Fachbegriffe, Synonyme, verwandte Konzepte
+   - Was würde ein Anwalt suchen um diese Frage zu beantworten?
+6. Spezifische Such-Hinweise für jeden Agent-Typ
+{doc_analysis_task}
 Respond in JSON format ONLY:
 {{
     "canton": null,
     "canton_name": null,
     "commune": null, 
     "response_language": "German/French/Italian/English",
-    "legal_domain": "specific domain name",
-    "legal_context": "brief explanation of the legal issue",
+    "legal_domain": "primary domain name",
+    "related_domains": ["related domain 1", "related domain 2"],
+    "legal_context": "detailed explanation of the legal issue",
     "relevant_articles": ["Art. X OR", "Art. Y ZGB"],
-    "irrelevant_articles": ["Art. Z OR - this is for different domain"],
-    "search_queries": {{
-        "primary_law": ["specific query 1", "specific query 2"],
-        "case_law": ["specific query 1", "specific query 2"]
+    "irrelevant_articles": [],
+    "key_terms": ["Schlüsselbegriff1", "Schlüsselbegriff2", "Schlüsselbegriff3"],
+    "synonyms": {{"Begriff1": ["Synonym1", "Synonym2"], "Begriff2": ["Synonym3"]}},
+    "search_hints": {{
+        "primary_law": "Hinweise für Bundesrecht-Suche",
+        "case_law": "Hinweise für BGE-Suche",
+        "cantonal_law": "Hinweise für kantonale Suche"
     }},
-    "reasoning": "explanation"
+    "document_analysis": {{
+        "document_type": "type of document or null if no document",
+        "parties": ["Party A", "Party B"],
+        "key_facts": ["fact 1", "fact 2", "fact 3"],
+        "amounts_dates": ["CHF X", "date Y"],
+        "problem": "the specific issue",
+        "legal_questions": ["question 1", "question 2"]
+    }},
+    "reasoning": "brief explanation"
 }}
 
-=== LEGAL DOMAIN MAPPING (CRITICAL - DO NOT MIX!) ===
+KONTEXT FÜR AGENTS - denke wie ein erfahrener Anwalt:
+- related_domains: Welche verwandten Rechtsgebiete sind auch relevant? (z.B. Erbrecht → Pflichtteilsrecht, Steuerrecht)
+- key_terms: Die wichtigsten Suchbegriffe (juristisch korrekt!)
+- synonyms: Alternative Begriffe die dasselbe meinen
+- search_hints: Spezifische Hinweise für jeden Agent-Typ
 
-**MIETRECHT (Rental Law)** - Art. 253-274 OR:
-- Mietzins/Erhöhung: Art. 269, 269a, 269d OR
-- Anfechtung Mietzins: Art. 270, 270a, 270b OR
-- Kündigung Mietvertrag: Art. 271, 271a, 272 OR
-- Mängel: Art. 259a-259i OR
-- VMWG (Verordnung): Art. 11-14 VMWG (Referenzzinssatz)
-- NICHT verwechseln mit: Art. 335-336 OR (das ist Arbeitsrecht!)
+Beispiel für "Wie hoch darf ein Zaun sein?":
+- key_terms: ["Zaunhöhe", "Einfriedung", "Grenzabstand", "Nachbarrecht"]
+- synonyms: {{"Zaun": ["Einfriedung", "Einzäunung"], "Höhe": ["Maximalhöhe", "Höchstmass"]}}
+- search_hints: {{
+    "primary_law": "Art. 684-686 ZGB, Sachenrecht Nachbarrecht",
+    "case_law": "BGE zu Einfriedungen, Immissionen, Grenzabstand",
+    "cantonal_law": "Bauverordnung, Baugesetz, Einfriedungsvorschriften"
+  }}
 
-**ARBEITSRECHT (Employment Law)** - Art. 319-362 OR:
-- Kündigung Arbeitsvertrag: Art. 335-335c OR
-- Kündigungsschutz: Art. 336-336b OR
-- Fristlose Kündigung: Art. 337 OR
-- Lohn: Art. 322-324 OR
-- NICHT verwechseln mit: Art. 269-274 OR (das ist Mietrecht!)
+HINWEIS zu "irrelevant_articles":
+- Setze irrelevant_articles NUR wenn echte Verwechslungsgefahr besteht (z.B. Mietrecht vs. Arbeitsrecht bei "Kündigung")
+- Bei den meisten Fragen: irrelevant_articles sollte LEER sein []
 
-**FAMILIENRECHT** - ZGB:
-- Unterhalt Kinder: Art. 276-277 ZGB
-- Unterhalt Berechnung: Art. 285 ZGB
-- Ehe: Art. 90-251 ZGB
-- Scheidung: Art. 111-134 ZGB
+KANTONS-ABKÜRZUNGEN (für canton field):
+ZH, BE, LU, UR, SZ, OW, NW, GL, ZG, FR, SO, BS, BL, SH, AR, AI, SG, GR, AG, TG, TI, VD, VS, NE, GE, JU
 
-**NACHBARRECHT** - ZGB:
-- Immissionen: Art. 684 ZGB
-- Grenzabstand: Art. 686-688 ZGB
-- Eigentum: Art. 679-698 ZGB
-
-**SACHENRECHT** - ZGB:
-- Eigentum: Art. 641-729 ZGB
-- Besitz: Art. 919-941 ZGB
-
-**HAFTPFLICHT** - OR:
-- Unerlaubte Handlung: Art. 41-61 OR
-
-**ERBRECHT** - ZGB:
-- Erbfolge: Art. 457-536 ZGB
-- Pflichtteil: Art. 470-480 ZGB
-
-=== LANGUAGE DETECTION ===
-- French: "Est-ce que", "loyer", "propriétaire", "bail"
-- German: "Kann", "Miete", "Vermieter", "kündigen"
-- Italian: "affitto", "locatore", "posso"
-
-=== CANTON DETECTION ===
-Set canton to null UNLESS explicitly mentioned by name or abbreviation.
-Canton names to detect:
-- Appenzell, Appenzell Innerrhoden → "AI"
-- Zürich, Zug, Bern, Basel, etc. → Use official abbreviation
 
 === EXAMPLES ===
 
-Example 1 - MIETRECHT (no canton):
-Question: "Kann ich mich gegen die Mietzinserhöhung wehren?"
-Response:
+Example 1 - MIETRECHT:
+Question: "Kann mein Vermieter mir einfach kündigen?"
 {{
-    "canton": null,
-    "canton_name": null,
-    "response_language": "German",
     "legal_domain": "Mietrecht",
-    "legal_context": "Anfechtung Mietzinserhöhung",
-    "relevant_articles": ["Art. 269d OR (Mietzinserhöhung)", "Art. 270a OR (Anfechtung)", "Art. 270b OR (Fristen)"],
-    "irrelevant_articles": ["Art. 335c OR - das ist Arbeitsrecht!"],
-    "search_queries": {{
-        "primary_law": ["Mietzinserhöhung Art. 269d OR", "Anfechtung Mietzins Art. 270a OR"],
-        "case_law": ["BGE Mietzinserhöhung", "BGE missbräuchlicher Mietzins"]
-    }},
-    "reasoning": "Frage betrifft Mietrecht, nicht Arbeitsrecht"
+    "related_domains": ["Prozessrecht (Anfechtung)", "Schlichtungsverfahren"],
+    "relevant_articles": ["Art. 271 OR", "Art. 271a OR", "Art. 266a OR"],
+    "key_terms": ["Kündigung", "Mietvertrag", "Kündigungsschutz", "Anfechtung"],
+    "search_hints": {{
+        "primary_law": "Art. 266a-271a OR Mietrecht Kündigung",
+        "case_law": "BGE Kündigungsschutz missbräuchliche Kündigung"
+    }}
 }}
 
-Example 2 - BAURECHT/NACHBARRECHT (with canton):
-Question: "Darf ich in Appenzell einen Zaun um meinen Garten bauen?"
-Response:
+Example 2 - ERBRECHT mit Liegenschaft:
+Question: "Was muss ich bei einem Erbvorbezug einer Liegenschaft beachten?"
+{{
+    "legal_domain": "Erbrecht",
+    "related_domains": ["Pflichtteilsrecht", "Herabsetzungsklage", "Grundstücksteuerrecht"],
+    "relevant_articles": ["Art. 626 ZGB", "Art. 627 ZGB", "Art. 522 ZGB", "Art. 560 ZGB"],
+    "key_terms": ["Erbvorbezug", "Ausgleichung", "Pflichtteil", "Herabsetzung", "Liegenschaft"],
+    "search_hints": {{
+        "primary_law": "Art. 626-628 ZGB Ausgleichung, Art. 522 ZGB Pflichtteil",
+        "case_law": "BGE Erbvorbezug Ausgleichung Pflichtteil"
+    }}
+}}
+
+Example 3 - NACHBARRECHT kantonal:
+Question: "Wie hoch darf ein Zaun in Appenzell sein?"
 {{
     "canton": "AI",
     "canton_name": "Appenzell Innerrhoden",
-    "response_language": "German",
     "legal_domain": "Nachbarrecht / Baurecht",
-    "legal_context": "Einfriedung, Zaun, Grenzabstand",
-    "relevant_articles": ["Art. 684 ZGB (Immissionen)", "Art. 686 ZGB (Grenzabstand)", "Kantonales Baugesetz AI"],
-    "irrelevant_articles": [],
-    "search_queries": {{
-        "primary_law": ["Einfriedung Zaun Art. 684 ZGB", "Grenzabstand Zaun Baugesetz Appenzell"],
-        "case_law": ["BGE Einfriedung Nachbarrecht", "BGE Zaun Grenze"]
-    }},
-    "reasoning": "Appenzell explizit erwähnt → Kanton AI. Baurecht/Nachbarrecht betroffen."
+    "related_domains": ["Kantonales Baurecht"],
+    "relevant_articles": ["Art. 684 ZGB", "Art. 686 ZGB"],
+    "key_terms": ["Zaunhöhe", "Einfriedung", "Grenzabstand"],
+    "search_hints": {{
+        "primary_law": "Art. 684-686 ZGB Nachbarrecht",
+        "cantonal_law": "Bauverordnung BauV Einfriedung"
+    }}
 }}
 
-Example 3 - ARBEITSRECHT:
-Question: "Kann mein Arbeitgeber mich einfach so kündigen?"
-Response:
-{{
-    "canton": null,
-    "canton_name": null,
-    "response_language": "German",
-    "legal_domain": "Arbeitsrecht",
-    "legal_context": "Kündigung Arbeitsvertrag",
-    "relevant_articles": ["Art. 335 OR", "Art. 335c OR (Fristen)", "Art. 336 OR (missbräuchlich)"],
-    "irrelevant_articles": ["Art. 271 OR - das ist Mietrecht!"],
-    "search_queries": {{
-        "primary_law": ["Kündigung Arbeitsvertrag Art. 335 OR", "Kündigungsschutz Art. 336 OR"],
-        "case_law": ["BGE Kündigung Arbeitsvertrag", "BGE missbräuchliche Kündigung"]
-    }},
-    "reasoning": "Arbeitsrecht, nicht Mietrecht"
-}}
-
-Now analyze the question above. Be VERY careful to identify the correct legal domain and ONLY use articles from that domain!"""
+Now analyze the question above and provide RICH CONTEXT for the agents."""
 
     try:
         from langchain_core.messages import HumanMessage
-        response = llm.invoke([HumanMessage(content=orchestrator_prompt.format(question=session.question))])
+        response = llm.invoke([HumanMessage(content=orchestrator_prompt.format(
+            question=session.question,
+            document_context=doc_context_for_orchestrator,
+            doc_analysis_task=doc_analysis_instruction
+        ))])
         
         # Parse JSON response
         response_text = response.content.strip()
@@ -562,14 +1028,24 @@ Now analyze the question above. Be VERY careful to identify the correct legal do
         import re
         
         # Try to find JSON in code block first
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+        json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', response_text, re.DOTALL)
         if json_match:
             response_text = json_match.group(1)
         else:
-            # Try to find raw JSON object
-            json_match = re.search(r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
+            # Try to find the outermost JSON object by matching braces
+            start_idx = response_text.find('{')
+            if start_idx != -1:
+                brace_count = 0
+                end_idx = start_idx
+                for i, char in enumerate(response_text[start_idx:], start_idx):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i
+                            break
+                response_text = response_text[start_idx:end_idx + 1]
         
         response_text = response_text.strip()
         session.orchestrator.add_log(f"Extracted JSON: {response_text[:200]}...", "debug")
@@ -606,37 +1082,48 @@ Now analyze the question above. Be VERY careful to identify the correct legal do
         
         # Extract legal domain and context
         session.legal_domain = analysis.get("legal_domain") or ""
+        session.related_domains = analysis.get("related_domains") or []
         session.legal_context = analysis.get("legal_context") or ""
         session.relevant_articles = analysis.get("relevant_articles") or []
         session.irrelevant_articles = analysis.get("irrelevant_articles") or []
         
+        # Extract enhanced context for agents (NEW!)
+        session.key_terms = analysis.get("key_terms") or []
+        session.synonyms = analysis.get("synonyms") or {}
+        session.search_hints = analysis.get("search_hints") or {}
+        
+        # Extract document analysis (new!)
+        doc_analysis = analysis.get("document_analysis") or {}
+        if doc_analysis and isinstance(doc_analysis, dict):
+            session.document_analysis = doc_analysis
+            if doc_analysis.get("document_type"):
+                session.orchestrator.add_log(f"📄 Document: {doc_analysis.get('document_type')}", "info")
+            if doc_analysis.get("problem"):
+                session.orchestrator.add_log(f"⚠️ Issue: {doc_analysis.get('problem')}", "info")
+            if doc_analysis.get("key_facts"):
+                facts = doc_analysis.get("key_facts", [])[:3]
+                session.orchestrator.add_log(f"📋 Key facts: {', '.join(facts)}", "info")
+        
         # Get search queries (new format) or fall back to search_topics (old format)
-        search_queries = analysis.get("search_queries") or {}
-        if search_queries:
-            session.search_queries = search_queries
-            primary_queries = search_queries.get("primary_law") or []
-            case_queries = search_queries.get("case_law") or []
-            if primary_queries:
-                session.orchestrator.add_log(f"🔍 Primary law queries: {', '.join(primary_queries[:2])}", "info")
-            if case_queries:
-                session.orchestrator.add_log(f"🔍 Case law queries: {', '.join(case_queries[:2])}", "info")
-        else:
-            # Fallback to old format
-            session.search_queries = {"primary_law": [], "case_law": []}
-            session.search_topics = analysis.get("search_topics") or []
-            if session.search_topics:
-                session.orchestrator.add_log(f"🔍 Search topics: {', '.join(session.search_topics)}", "info")
+        # NOTE: Agents now plan their own searches - this is kept for backward compatibility only
+        session.search_queries = {}  # Not used anymore - agents are agentic
         
         # Log results
         session.orchestrator.add_log(f"🌐 Response language: {session.response_language}", "info")
         if session.legal_domain:
             session.orchestrator.add_log(f"⚖️ Legal domain: {session.legal_domain}", "info")
+        if session.related_domains:
+            session.orchestrator.add_log(f"🔗 Related: {', '.join(session.related_domains[:3])}", "info")
         if session.legal_context:
             session.orchestrator.add_log(f"📚 Context: {session.legal_context}", "info")
         if session.relevant_articles:
             session.orchestrator.add_log(f"✅ Relevant articles: {', '.join(session.relevant_articles[:4])}", "info")
         if session.irrelevant_articles:
             session.orchestrator.add_log(f"❌ AVOID: {', '.join(session.irrelevant_articles[:2])}", "warning")
+        if session.key_terms:
+            session.orchestrator.add_log(f"🔑 Key terms: {', '.join(session.key_terms[:5])}", "info")
+        if session.search_hints:
+            session.orchestrator.add_log(f"💡 Search hints provided for agents", "info")
         if session.has_cantonal_scope:
             session.orchestrator.add_log(f"🏔️ Canton: {session.canton} ({session.canton_name.get('de', '')})", "info")
             if session.commune:
@@ -665,486 +1152,299 @@ Now analyze the question above. Be VERY careful to identify the correct legal do
     yield session
     
     # Build dynamic pipeline based on whether canton is detected
+    # Note: Primary Law, Case Law, Cantonal Law, and Cantonal Case Law run IN PARALLEL
     if session.has_cantonal_scope:
         session.orchestrator.pipeline = [
-            {"step": 1, "agent": "Primary Law Agent", "status": "pending"},
-            {"step": 2, "agent": "Cantonal Law Agent", "status": "pending"},
-            {"step": 3, "agent": "Case Law Agent", "status": "pending"},
-            {"step": 4, "agent": "Analysis Agent", "status": "pending"},
+            {"step": 1, "agent": "Primary Law Agent", "status": "pending", "parallel": True},
+            {"step": 1, "agent": "Cantonal Law Agent", "status": "pending", "parallel": True},
+            {"step": 1, "agent": "Cantonal Case Law Agent", "status": "pending", "parallel": True},
+            {"step": 1, "agent": "Case Law Agent", "status": "pending", "parallel": True},
+            {"step": 2, "agent": "Analysis Agent", "status": "pending"},
         ]
     else:
         session.orchestrator.pipeline = [
-            {"step": 1, "agent": "Primary Law Agent", "status": "pending"},
-            {"step": 2, "agent": "Case Law Agent", "status": "pending"},
-            {"step": 3, "agent": "Analysis Agent", "status": "pending"},
+            {"step": 1, "agent": "Primary Law Agent", "status": "pending", "parallel": True},
+            {"step": 1, "agent": "Case Law Agent", "status": "pending", "parallel": True},
+            {"step": 2, "agent": "Analysis Agent", "status": "pending"},
         ]
     
     session.orchestrator.add_log("Pipeline initialized", "start")
     session.orchestrator.add_log(f"Question: {session.question[:100]}...", "info")
+    session.orchestrator.add_log("⚡ Parallel execution enabled for search agents", "config")
     
     if session.has_cantonal_scope:
-        session.orchestrator.add_log("→ Including cantonal law search in pipeline", "info")
+        session.orchestrator.add_log("→ Including cantonal law + cantonal case law search in pipeline", "info")
     
     if session.document_text:
         session.orchestrator.add_log(f"Document loaded: {session.document_name} ({len(session.document_text)} chars)", "info")
-    session.orchestrator.add_log(f"LLM: {model_name}", "config")
+    
+    # Show hybrid model configuration
+    _, agent_model = get_llm("agent")
+    session.orchestrator.add_log(f"🧠 Orchestrator/Analysis: {model_name}", "config")
+    session.orchestrator.add_log(f"⚡ Search Agents: {agent_model}", "config")
     yield session
     
-    # ========== ORCHESTRATOR: DISPATCH PRIMARY LAW AGENT ==========
-    session.orchestrator.current_step = "Dispatching Primary Law Agent"
-    session.orchestrator.pipeline[0]["status"] = "running"
-    session.orchestrator.add_log("Dispatching Primary Law Agent", "dispatch")
+
+    # ========== PARALLEL AGENT EXECUTION ==========
+    session.orchestrator.current_step = "Dispatching Search Agents (Parallel)"
+    session.orchestrator.add_log("🚀 Starting parallel agent execution", "dispatch")
     
-    # Build rich context from orchestrator analysis
-    orchestrator_context = {
+    # Set all search agents to running
+    for item in session.orchestrator.pipeline:
+        if item.get("parallel"):
+            item["status"] = "running"
+    
+    # Build AGENT-SPECIFIC contexts (saves tokens - each agent only gets what it needs!)
+    
+    # Helper to convert lists to compact strings
+    def to_str(lst):
+        return ", ".join(lst) if lst else ""
+    
+    # Common base context
+    base_context = {
         "question": session.question,
         "language": session.response_language,
         "legal_domain": session.legal_domain,
-        "legal_context": session.legal_context,
-        "relevant_articles": session.relevant_articles,
-        "irrelevant_articles": session.irrelevant_articles,
-        "search_queries": session.search_queries.get("primary_law", []) if session.search_queries else [],
-        "document": f"{len(session.document_text)} chars" if session.document_text else None,
-        "canton": session.canton if session.canton else None
     }
     
-    # Track what orchestrator passes to this agent
-    session.orchestrator.set_agent_input("Primary Law Agent", orchestrator_context)
-    yield session
+    # PRIMARY LAW AGENT - Federal law focus
+    primary_law_context = {
+        **base_context,
+        "related_domains": to_str(session.related_domains),
+        "relevant_articles": to_str(session.relevant_articles),
+        "key_terms": to_str(session.key_terms),
+        "search_hint": (session.search_hints or {}).get("primary_law", ""),
+    }
     
-    # ========== PRIMARY LAW AGENT ==========
-    agent = session.primary_law_agent
-    agent.status = AgentStatus.RUNNING
-    agent.current_action = "Starting"
-    agent.add_log("Agent activated by orchestrator", "start")
-    if session.legal_domain:
-        agent.add_log(f"⚖️ Rechtsgebiet: {session.legal_domain}", "info")
-    if session.relevant_articles:
-        agent.add_log(f"✅ Relevante Artikel: {', '.join(session.relevant_articles[:3])}", "info")
-    if session.irrelevant_articles:
-        agent.add_log(f"❌ NICHT verwenden: {', '.join(session.irrelevant_articles[:2])}", "warning")
-    yield session
+    # CASE LAW AGENT - BGE focus
+    case_law_context = {
+        **base_context,
+        "related_domains": to_str(session.related_domains),
+        "relevant_articles": to_str(session.relevant_articles),
+        "key_terms": to_str(session.key_terms),
+        "search_hint": (session.search_hints or {}).get("case_law", ""),
+    }
     
-    # Search
-    agent.current_action = "Searching Fedlex/admin.ch"
+    # CANTONAL LAW AGENT - Canton-specific
+    cantonal_law_context = {
+        **base_context,
+        "canton": session.canton,
+        "canton_name": session.canton_name.get("de", session.canton) if session.canton_name else session.canton,
+        "commune": session.commune or "",
+        "key_terms": to_str(session.key_terms),
+        "search_hint": (session.search_hints or {}).get("cantonal_law", ""),
+    }
     
-    # Use specific queries from orchestrator if available
-    primary_queries = session.search_queries.get("primary_law", []) if session.search_queries else []
+    # CANTONAL CASE LAW AGENT - Canton court decisions
+    cantonal_case_law_context = {
+        **base_context,
+        "canton": session.canton,
+        "canton_name": session.canton_name.get("de", session.canton) if session.canton_name else session.canton,
+        "key_terms": to_str(session.key_terms),
+        "search_hint": (session.search_hints or {}).get("cantonal_law", ""),
+    }
     
-    if primary_queries:
-        # Use orchestrator's specific queries
-        search_query = " OR ".join(primary_queries[:3])
-        agent.add_log(f"Using orchestrator queries: {len(primary_queries)} specific queries", "search")
-        for q in primary_queries[:3]:
-            agent.add_log(f"  → {q}", "search")
-    elif session.search_topics:
-        # Fallback to old format
-        topics_str = " ".join(session.search_topics[:3])
-        search_query = f"{session.question} {topics_str}"
-    else:
-        search_query = session.question
-    
-    agent.search_query = search_query
-    agent.add_log(f"Combined query: {search_query[:100]}...", "search")
-    yield session
-    
-    # Run multiple searches for better coverage
-    search_start = time.time()
-    try:
-        agent.add_log("Calling Tavily API (fedlex.admin.ch, admin.ch)", "tool_call")
-        yield session
-        
-        all_results = []
-        
-        # Primary search with combined query
-        main_results = search_swiss_primary_law(search_query)
-        all_results.append(main_results)
-        
-        # If we have specific queries, also search each one individually
-        if primary_queries and len(primary_queries) > 1:
-            for i, query in enumerate(primary_queries[:2]):  # Max 2 additional searches
-                agent.add_log(f"Additional search {i+1}: {query[:50]}...", "tool_call")
-                additional = search_swiss_primary_law(query, max_results=3)
-                all_results.append(additional)
-        
-        agent.search_results = "\n\n---\n\n".join(all_results)
-        search_duration = (time.time() - search_start) * 1000
-        
-        agent.add_log(f"Search complete ({search_duration:.0f}ms)", "tool_result")
-        agent.add_log(f"Results: {len(agent.search_results)} characters", "tool_result")
-        yield session
-        
-    except Exception as e:
-        agent.status = AgentStatus.ERROR
-        agent.error = str(e)
-        agent.add_log(f"Search failed: {str(e)}", "error")
-        session.errors.append(f"Primary Law Search: {str(e)}")
-        yield session
-    
-    # LLM Analysis
-    if agent.status != AgentStatus.ERROR:
-        agent.current_action = "Analyzing with LLM"
-        
-        # Use prompts from prompts.py with orchestrator context
-        doc_context = ""
-        if session.document_text:
-            doc_context = f"DOCUMENT TO CONSIDER:\n{session.document_text[:2000]}..."
-        
-        agent.system_prompt, agent.user_prompt = get_primary_law_prompt(
-            search_results=agent.search_results[:4000],
-            question=session.question,
-            document_context=doc_context,
-            legal_domain=session.legal_domain,
-            legal_context=session.legal_context,
-            relevant_articles=session.relevant_articles,
-            irrelevant_articles=session.irrelevant_articles
-        )
-        agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
-        
-        # Track data received
-        agent.data_received = {
-            "question": session.question,
-            "legal_domain": session.legal_domain,
-            "relevant_articles": session.relevant_articles,
-            "document": session.document_text[:500] + "..." if session.document_text else None,
-            "search_results_length": len(agent.search_results)
-        }
-        
-        agent.add_log(f"Sending to LLM ({model_name})", "llm_call")
-        agent.add_log(f"System prompt: {len(agent.system_prompt)} chars", "llm_call")
-        agent.add_log(f"User prompt: {len(agent.user_prompt)} chars", "llm_call")
-        yield session
-        
-        llm_start = time.time()
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content=agent.system_prompt),
-                HumanMessage(content=agent.user_prompt)
-            ]
-            response = llm.invoke(messages)
-            agent.llm_response = response.content
-            llm_duration = (time.time() - llm_start) * 1000
-            
-            # Track data to send
-            agent.data_sent = {
-                "analysis": agent.llm_response,
-                "length": len(agent.llm_response)
-            }
-            
-            agent.add_log(f"LLM response received ({llm_duration:.0f}ms)", "llm_response")
-            agent.add_log(f"Response length: {len(agent.llm_response)} chars", "llm_response")
-            yield session
-            
-        except Exception as e:
-            agent.status = AgentStatus.ERROR
-            agent.error = str(e)
-            agent.add_log(f"LLM call failed: {str(e)}", "error")
-            session.errors.append(f"Primary Law LLM: {str(e)}")
-            yield session
-    
-    # Complete
-    agent.duration_ms = (time.time() - pipeline_start) * 1000
-    if agent.status != AgentStatus.ERROR:
-        agent.status = AgentStatus.COMPLETE
-        agent.current_action = "Complete"
-        agent.add_log("Agent complete", "complete")
-        if session.has_cantonal_scope:
-            agent.add_log("Result will be passed to → Cantonal Law Agent → Analysis Agent", "handoff")
-        else:
-            agent.add_log("Result will be passed to → Analysis Agent", "handoff")
-    
-    session.orchestrator.pipeline[0]["status"] = "complete" if agent.status == AgentStatus.COMPLETE else "error"
-    session.orchestrator.add_log(f"Primary Law Agent finished ({agent.duration_ms:.0f}ms)", "complete")
-    yield session
-    
-    # ========== CANTONAL LAW AGENT (if canton detected) ==========
-    cantonal_step_offset = 0
+    # Set agent inputs (for UI display)
+    session.orchestrator.set_agent_input("Primary Law Agent", primary_law_context)
+    session.orchestrator.set_agent_input("Case Law Agent", case_law_context)
     if session.has_cantonal_scope:
-        cantonal_step_offset = 1  # Shifts subsequent step indices by 1
+        session.orchestrator.set_agent_input("Cantonal Law Agent", cantonal_law_context)
+        session.orchestrator.set_agent_input("Cantonal Case Law Agent", cantonal_case_law_context)
+    
+    # Initialize agent states
+    session.primary_law_agent.status = AgentStatus.RUNNING
+    session.primary_law_agent.current_action = "Running in parallel"
+    session.primary_law_agent.add_log("Agent activated (parallel mode)", "start")
+    if session.legal_domain:
+        session.primary_law_agent.add_log(f"⚖️ Rechtsgebiet: {session.legal_domain}", "info")
+    
+    session.case_law_agent.status = AgentStatus.RUNNING
+    session.case_law_agent.current_action = "Running in parallel"
+    session.case_law_agent.add_log("Agent activated (parallel mode)", "start")
+    
+    if session.has_cantonal_scope:
+        session.cantonal_law_agent.status = AgentStatus.RUNNING
+        session.cantonal_law_agent.current_action = "Running in parallel"
+        session.cantonal_law_agent.add_log("Agent activated (parallel mode)", "start")
+        session.cantonal_law_agent.add_log(f"🏛️ Kanton: {session.canton}", "info")
         
-        session.orchestrator.current_step = "Dispatching Cantonal Law Agent"
-        session.orchestrator.pipeline[1]["status"] = "running"
-        session.orchestrator.add_log(f"Dispatching Cantonal Law Agent for {session.canton}", "dispatch")
+        session.cantonal_case_law_agent.status = AgentStatus.RUNNING
+        session.cantonal_case_law_agent.current_action = "Running in parallel"
+        session.cantonal_case_law_agent.add_log("Agent activated (parallel mode)", "start")
+        session.cantonal_case_law_agent.add_log(f"🏛️ Kanton: {session.canton} - Rechtsprechung", "info")
+    
+    yield session
+    
+    # Submit all agents to thread pool
+    parallel_start = time.time()
+    futures = {}
+    
+    # max_workers = 4 if cantonal scope (primary, case, cantonal_law, cantonal_case)
+    num_workers = 4 if session.has_cantonal_scope else 2
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit Primary Law Agent
+        futures[executor.submit(run_primary_law_agent_work, session)] = "primary_law"
+        session.orchestrator.add_log("→ Primary Law Agent started", "dispatch")
         
-        # Track what orchestrator passes to this agent
-        canton_display = session.canton_name.get("de", session.canton) if session.canton_name else session.canton
-        session.orchestrator.set_agent_input("Cantonal Law Agent", {
-            "question": session.question,
-            "canton": f"{session.canton} ({canton_display})",
-            "commune": session.commune or "None",
-            "language": session.response_language
-        })
+        # Submit Case Law Agent
+        futures[executor.submit(run_case_law_agent_work, session)] = "case_law"
+        session.orchestrator.add_log("→ Case Law Agent started", "dispatch")
+        
+        # Submit Cantonal Law Agent if needed
+        if session.has_cantonal_scope:
+            futures[executor.submit(run_cantonal_law_agent_work, session)] = "cantonal_law"
+            session.orchestrator.add_log(f"→ Cantonal Law Agent started ({session.canton})", "dispatch")
+            
+            # Submit Cantonal Case Law Agent (SEPARATE!)
+            futures[executor.submit(run_cantonal_case_law_agent_work, session)] = "cantonal_case_law"
+            session.orchestrator.add_log(f"→ Cantonal Case Law Agent started ({session.canton})", "dispatch")
+        
         yield session
         
-        cantonal_start = time.time()
-        agent = session.cantonal_law_agent
-        agent.status = AgentStatus.RUNNING
-        agent.current_action = "Starting"
-        agent.add_log("Agent activated by orchestrator", "start")
-        agent.add_log(f"Searching cantonal law for: {session.canton}", "info")
-        if session.commune:
-            agent.add_log(f"Including communal regulations for: {session.commune}", "info")
-        yield session
+        # Wait for results and update as each completes
+        completed_count = 0
+        total_agents = len(futures)
         
-        # Search cantonal law
-        agent.current_action = f"Searching {session.canton} law"
-        agent.search_query = f"{session.question} (Canton {session.canton})"
-        agent.add_log(f"Preparing cantonal search", "search")
-        yield session
-        
-        search_start = time.time()
-        try:
-            canton_display = session.canton_name.get("de", session.canton) if session.canton_name else session.canton
-            agent.add_log(f"Calling Tavily API (cantonal sources for {canton_display})", "tool_call")
-            yield session
+        for future in as_completed(futures):
+            agent_type = futures[future]
+            completed_count += 1
             
-            # Search cantonal law
-            cantonal_results = search_cantonal_law(session.question, session.canton)
-            
-            # Also search cantonal case law
-            cantonal_case_results = search_cantonal_case_law(session.question, session.canton)
-            
-            # Combine results
-            agent.search_results = f"{cantonal_results}\n\n{cantonal_case_results}"
-            
-            # If commune is specified, also search communal law
-            if session.commune:
-                communal_results = search_communal_law(session.question, session.commune, session.canton)
-                agent.search_results += f"\n\n{communal_results}"
-            
-            search_duration = (time.time() - search_start) * 1000
-            agent.add_log(f"Cantonal search complete ({search_duration:.0f}ms)", "tool_result")
-            agent.add_log(f"Results: {len(agent.search_results)} characters", "tool_result")
-            yield session
-            
-        except Exception as e:
-            agent.status = AgentStatus.ERROR
-            agent.error = str(e)
-            agent.add_log(f"Cantonal search failed: {str(e)}", "error")
-            session.errors.append(f"Cantonal Law Search: {str(e)}")
-            yield session
-        
-        # LLM Analysis of cantonal law
-        if agent.status != AgentStatus.ERROR:
-            agent.current_action = "Analyzing cantonal law with LLM"
-            
-            canton_display = session.canton_name.get("de", session.canton) if session.canton_name else session.canton
-            agent.system_prompt = f"""You are a Swiss cantonal law specialist for {canton_display} ({session.canton}).
-
-YOUR TASK:
-Analyze the cantonal law search results and identify relevant cantonal provisions.
-
-CITATION REQUIREMENTS:
-- Cite cantonal laws with their official designation
-- Include links to cantonal law portals where available
-- Note the canton clearly in each citation
-
-LANGUAGE RULES:
-- Respond in the same language as the user's question
-- Use appropriate cantonal terminology
-
-OUTPUT FORMAT:
-1. List relevant cantonal provisions
-2. Note any cantonal court decisions
-3. If communal regulations were found, list those separately
-4. Explain how cantonal law relates to federal law on this topic"""
-
-            commune_info = f"\nCommune: {session.commune}" if session.commune else ""
-            agent.user_prompt = f"""CANTONAL LAW SEARCH RESULTS FOR {session.canton}:
-{agent.search_results[:6000]}
-
-USER QUESTION:
-{session.question}
-
-CANTON: {canton_display} ({session.canton}){commune_info}
-
-Please analyze the cantonal law provisions."""
-
-            agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
-            
-            agent.add_log(f"Sending to LLM ({model_name})", "llm_call")
-            yield session
-            
-            llm_start = time.time()
             try:
-                from langchain_core.messages import SystemMessage, HumanMessage
-                messages = [
-                    SystemMessage(content=agent.system_prompt),
-                    HumanMessage(content=agent.user_prompt)
-                ]
-                response = llm.invoke(messages)
-                agent.llm_response = response.content
-                llm_duration = (time.time() - llm_start) * 1000
+                result = future.result()
                 
-                agent.add_log(f"LLM response received ({llm_duration:.0f}ms)", "llm_response")
-                yield session
+                if agent_type == "primary_law":
+                    agent = session.primary_law_agent
+                    agent.search_results = result["search_results"]
+                    agent.llm_response = result["llm_response"]
+                    agent.system_prompt = result.get("system_prompt", "")
+                    agent.user_prompt = result.get("user_prompt", "")
+                    agent.search_query = result.get("search_query", "")
+                    agent.planned_queries = result.get("planned_queries", [])
+                    agent.planning_duration_ms = result.get("planning_duration_ms", 0)
+                    agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
+                    agent.duration_ms = result["total_duration_ms"]
+                    
+                    if result["error"]:
+                        agent.status = AgentStatus.ERROR
+                        agent.error = result["error"]
+                        agent.add_log(f"❌ Error: {result['error']}", "error")
+                        session.orchestrator.pipeline[0]["status"] = "error"
+                    else:
+                        agent.status = AgentStatus.COMPLETE
+                        agent.current_action = "Complete"
+                        if agent.planned_queries:
+                            agent.add_log(f"🧠 Planned {len(agent.planned_queries)} searches ({agent.planning_duration_ms:.0f}ms)", "planning")
+                        agent.add_log(f"✅ Search: {result['search_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ LLM: {result['llm_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ Total: {result['total_duration_ms']:.0f}ms", "complete")
+                        session.orchestrator.pipeline[0]["status"] = "complete"
+                    
+                    session.orchestrator.add_log(f"Primary Law Agent finished ({result['total_duration_ms']:.0f}ms) [{completed_count}/{total_agents}]", "complete")
+                
+                elif agent_type == "case_law":
+                    agent = session.case_law_agent
+                    agent.search_results = result["search_results"]
+                    agent.llm_response = result["llm_response"]
+                    agent.system_prompt = result.get("system_prompt", "")
+                    agent.user_prompt = result.get("user_prompt", "")
+                    agent.search_query = result.get("search_query", "")
+                    agent.planned_queries = result.get("planned_queries", [])
+                    agent.planning_duration_ms = result.get("planning_duration_ms", 0)
+                    agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
+                    agent.duration_ms = result["total_duration_ms"]
+                    
+                    # Find case law index in pipeline (it's after cantonal agents if present)
+                    case_idx = 1 if not session.has_cantonal_scope else 3
+                    
+                    if result["error"]:
+                        agent.status = AgentStatus.ERROR
+                        agent.error = result["error"]
+                        agent.add_log(f"❌ Error: {result['error']}", "error")
+                        session.orchestrator.pipeline[case_idx]["status"] = "error"
+                    else:
+                        agent.status = AgentStatus.COMPLETE
+                        agent.current_action = "Complete"
+                        if agent.planned_queries:
+                            agent.add_log(f"🧠 Planned {len(agent.planned_queries)} searches ({agent.planning_duration_ms:.0f}ms)", "planning")
+                        agent.add_log(f"✅ Search: {result['search_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ LLM: {result['llm_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ Total: {result['total_duration_ms']:.0f}ms", "complete")
+                        session.orchestrator.pipeline[case_idx]["status"] = "complete"
+                    
+                    session.orchestrator.add_log(f"Case Law Agent finished ({result['total_duration_ms']:.0f}ms) [{completed_count}/{total_agents}]", "complete")
+                
+                elif agent_type == "cantonal_law":
+                    agent = session.cantonal_law_agent
+                    agent.search_results = result["search_results"]
+                    agent.llm_response = result["llm_response"]
+                    agent.system_prompt = result.get("system_prompt", "")
+                    agent.user_prompt = result.get("user_prompt", "")
+                    agent.search_query = result.get("search_query", "")
+                    agent.planned_queries = result.get("planned_queries", [])
+                    agent.planning_duration_ms = result.get("planning_duration_ms", 0)
+                    agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
+                    agent.duration_ms = result["total_duration_ms"]
+                    
+                    if result["error"]:
+                        agent.status = AgentStatus.ERROR
+                        agent.error = result["error"]
+                        agent.add_log(f"❌ Error: {result['error']}", "error")
+                        session.orchestrator.pipeline[1]["status"] = "error"
+                    else:
+                        agent.status = AgentStatus.COMPLETE
+                        agent.current_action = "Complete"
+                        if agent.planned_queries:
+                            agent.add_log(f"🧠 Planned {len(agent.planned_queries)} searches ({agent.planning_duration_ms:.0f}ms)", "planning")
+                        agent.add_log(f"✅ Search: {result['search_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ LLM: {result['llm_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ Total: {result['total_duration_ms']:.0f}ms", "complete")
+                        session.orchestrator.pipeline[1]["status"] = "complete"
+                    
+                    session.orchestrator.add_log(f"Cantonal Law Agent finished ({result['total_duration_ms']:.0f}ms) [{completed_count}/{total_agents}]", "complete")
+                
+                elif agent_type == "cantonal_case_law":
+                    agent = session.cantonal_case_law_agent
+                    agent.search_results = result["search_results"]
+                    agent.llm_response = result["llm_response"]
+                    agent.system_prompt = result.get("system_prompt", "")
+                    agent.user_prompt = result.get("user_prompt", "")
+                    agent.search_query = result.get("search_query", "")
+                    agent.planned_queries = result.get("planned_queries", [])
+                    agent.planning_duration_ms = result.get("planning_duration_ms", 0)
+                    agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
+                    agent.duration_ms = result["total_duration_ms"]
+                    
+                    if result["error"]:
+                        agent.status = AgentStatus.ERROR
+                        agent.error = result["error"]
+                        agent.add_log(f"❌ Error: {result['error']}", "error")
+                        session.orchestrator.pipeline[2]["status"] = "error"
+                    else:
+                        agent.status = AgentStatus.COMPLETE
+                        agent.current_action = "Complete"
+                        if agent.planned_queries:
+                            agent.add_log(f"🧠 Planned {len(agent.planned_queries)} searches ({agent.planning_duration_ms:.0f}ms)", "planning")
+                        agent.add_log(f"✅ Search: {result['search_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ LLM: {result['llm_duration_ms']:.0f}ms", "complete")
+                        agent.add_log(f"✅ Total: {result['total_duration_ms']:.0f}ms", "complete")
+                        session.orchestrator.pipeline[2]["status"] = "complete"
+                    
+                    session.orchestrator.add_log(f"Cantonal Case Law Agent finished ({result['total_duration_ms']:.0f}ms) [{completed_count}/{total_agents}]", "complete")
                 
             except Exception as e:
-                agent.status = AgentStatus.ERROR
-                agent.error = str(e)
-                agent.add_log(f"LLM call failed: {str(e)}", "error")
-                session.errors.append(f"Cantonal Law LLM: {str(e)}")
-                yield session
-        
-        # Complete cantonal agent
-        agent.duration_ms = (time.time() - cantonal_start) * 1000
-        if agent.status != AgentStatus.ERROR:
-            agent.status = AgentStatus.COMPLETE
-            agent.current_action = "Complete"
-            agent.add_log("Agent complete", "complete")
-            agent.add_log("Result will be passed to → Analysis Agent", "handoff")
-        
-        session.orchestrator.pipeline[1]["status"] = "complete" if agent.status == AgentStatus.COMPLETE else "error"
-        session.orchestrator.add_log(f"Cantonal Law Agent finished ({agent.duration_ms:.0f}ms)", "complete")
-        yield session
-    
-    # ========== ORCHESTRATOR: DISPATCH CASE LAW AGENT ==========
-    case_step_idx = 1 + cantonal_step_offset
-    session.orchestrator.current_step = "Dispatching Case Law Agent"
-    session.orchestrator.pipeline[case_step_idx]["status"] = "running"
-    session.orchestrator.add_log("Dispatching Case Law Agent", "dispatch")
-    
-    # Build rich context from orchestrator analysis
-    case_queries = session.search_queries.get("case_law", []) if session.search_queries else []
-    orchestrator_context = {
-        "question": session.question,
-        "language": session.response_language,
-        "legal_domain": session.legal_domain,
-        "legal_context": session.legal_context,
-        "search_queries": case_queries
-    }
-    
-    # Track what orchestrator passes to this agent
-    session.orchestrator.set_agent_input("Case Law Agent", orchestrator_context)
-    yield session
-    
-    # ========== CASE LAW AGENT ==========
-    case_start = time.time()
-    agent = session.case_law_agent
-    agent.status = AgentStatus.RUNNING
-    agent.current_action = "Starting"
-    agent.add_log("Agent activated by orchestrator", "start")
-    if session.legal_domain:
-        agent.add_log(f"⚖️ Rechtsgebiet: {session.legal_domain}", "info")
-    yield session
-    
-    # Search
-    agent.current_action = "Searching BGer"
-    
-    # Use specific queries from orchestrator if available
-    if case_queries:
-        search_query = " OR ".join(case_queries[:3])
-        agent.add_log(f"Using orchestrator queries: {len(case_queries)} specific queries", "search")
-        for q in case_queries[:3]:
-            agent.add_log(f"  → {q}", "search")
-    elif session.search_topics:
-        topics_str = " ".join(session.search_topics[:3])
-        search_query = f"{session.question} {topics_str}"
-    else:
-        search_query = session.question
-    
-    agent.search_query = search_query
-    agent.add_log(f"Query: {search_query[:100]}...", "search")
-    yield session
-    
-    search_start = time.time()
-    try:
-        agent.add_log("Calling Tavily API (bger.ch)", "tool_call")
-        yield session
-        
-        all_results = []
-        
-        # Primary search
-        main_results = search_swiss_case_law(search_query)
-        all_results.append(main_results)
-        
-        # Additional searches for specific queries
-        if case_queries and len(case_queries) > 1:
-            for i, query in enumerate(case_queries[:2]):
-                agent.add_log(f"Additional search {i+1}: {query[:50]}...", "tool_call")
-                additional = search_swiss_case_law(query, max_results=3)
-                all_results.append(additional)
-        
-        agent.search_results = "\n\n---\n\n".join(all_results)
-        search_duration = (time.time() - search_start) * 1000
-        
-        agent.add_log(f"Search complete ({search_duration:.0f}ms)", "tool_result")
-        agent.add_log(f"Results: {len(agent.search_results)} characters", "tool_result")
-        yield session
-        
-    except Exception as e:
-        agent.status = AgentStatus.ERROR
-        agent.error = str(e)
-        agent.add_log(f"Search failed: {str(e)}", "error")
-        session.errors.append(f"Case Law Search: {str(e)}")
-        yield session
-    
-    # LLM Analysis
-    if agent.status != AgentStatus.ERROR:
-        agent.current_action = "Analyzing with LLM"
-        
-        agent.system_prompt, agent.user_prompt = get_case_law_prompt(
-            search_results=agent.search_results[:4000],
-            question=session.question,
-            legal_domain=session.legal_domain,
-            legal_context=session.legal_context
-        )
-        agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
-        
-        # Track data received
-        agent.data_received = {
-            "question": session.question,
-            "legal_domain": session.legal_domain,
-            "search_results_length": len(agent.search_results)
-        }
-        
-        agent.add_log(f"Sending to LLM ({model_name})", "llm_call")
-        agent.add_log(f"System prompt: {len(agent.system_prompt)} chars", "llm_call")
-        agent.add_log(f"User prompt: {len(agent.user_prompt)} chars", "llm_call")
-        yield session
-        
-        llm_start = time.time()
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content=agent.system_prompt),
-                HumanMessage(content=agent.user_prompt)
-            ]
-            response = llm.invoke(messages)
-            agent.llm_response = response.content
-            llm_duration = (time.time() - llm_start) * 1000
+                session.orchestrator.add_log(f"❌ {agent_type} failed: {str(e)}", "error")
+                session.errors.append(f"{agent_type}: {str(e)}")
             
-            # Track data to send
-            agent.data_sent = {
-                "analysis": agent.llm_response,
-                "length": len(agent.llm_response)
-            }
-            
-            agent.add_log(f"LLM response received ({llm_duration:.0f}ms)", "llm_response")
-            yield session
-            
-        except Exception as e:
-            agent.status = AgentStatus.ERROR
-            agent.error = str(e)
-            agent.add_log(f"LLM call failed: {str(e)}", "error")
-            session.errors.append(f"Case Law LLM: {str(e)}")
             yield session
     
-    # Complete
-    agent.duration_ms = (time.time() - case_start) * 1000
-    if agent.status != AgentStatus.ERROR:
-        agent.status = AgentStatus.COMPLETE
-        agent.current_action = "Complete"
-        agent.add_log("Agent complete", "complete")
-        agent.add_log("Result will be passed to → Analysis Agent", "handoff")
-    
-    session.orchestrator.pipeline[case_step_idx]["status"] = "complete" if agent.status == AgentStatus.COMPLETE else "error"
-    session.orchestrator.add_log(f"Case Law Agent finished ({agent.duration_ms:.0f}ms)", "complete")
+    parallel_duration = (time.time() - parallel_start) * 1000
+    session.orchestrator.add_log(f"⚡ All search agents completed in {parallel_duration:.0f}ms (parallel)", "complete")
     yield session
     
     # ========== ORCHESTRATOR: DISPATCH ANALYSIS AGENT ==========
-    analysis_step_idx = 2 + cantonal_step_offset
+    # Analysis is the last step: index 4 for cantonal (5 agents), index 2 for non-cantonal (3 agents)
+    analysis_step_idx = 4 if session.has_cantonal_scope else 2
     session.orchestrator.current_step = "Dispatching Analysis Agent"
     session.orchestrator.pipeline[analysis_step_idx]["status"] = "running"
     session.orchestrator.add_log("Dispatching Analysis Agent", "dispatch")
@@ -1157,9 +1457,18 @@ Please analyze the cantonal law provisions."""
         "document": f"{len(session.document_text)} chars" if session.document_text else "None",
         "language": session.response_language
     }
+    
+    # Add document analysis if available
+    if session.document_analysis:
+        doc_type = session.document_analysis.get("document_type", "")
+        problem = session.document_analysis.get("problem", "")
+        if doc_type or problem:
+            analysis_inputs["document_analysis"] = f"{doc_type}: {problem[:50]}..." if problem else doc_type
+    
     if session.has_cantonal_scope:
         analysis_inputs["cantonal_law_agent"] = f"{len(session.cantonal_law_agent.llm_response or '')} chars ({session.canton})"
-        session.orchestrator.add_log("Passing: primary_law, cantonal_law, case_law, question, document", "dispatch")
+        analysis_inputs["cantonal_case_law_agent"] = f"{len(session.cantonal_case_law_agent.llm_response or '')} chars ({session.canton})"
+        session.orchestrator.add_log("Passing: primary_law, cantonal_law, cantonal_case_law, case_law, question, document", "dispatch")
     else:
         session.orchestrator.add_log("Passing: primary_law, case_law, question, document", "dispatch")
     session.orchestrator.set_agent_input("Analysis Agent", analysis_inputs)
@@ -1174,6 +1483,7 @@ Please analyze the cantonal law provisions."""
     agent.add_log("📨 Received: Primary Law Agent results", "input")
     if session.has_cantonal_scope:
         agent.add_log(f"📨 Received: Cantonal Law Agent results ({session.canton})", "input")
+        agent.add_log(f"📨 Received: Cantonal Case Law Agent results ({session.canton})", "input")
     agent.add_log("📨 Received: Case Law Agent results", "input")
     if session.document_text:
         agent.add_log(f"📨 Received: User document ({len(session.document_text)} chars)", "input")
@@ -1186,27 +1496,38 @@ Please analyze the cantonal law provisions."""
     primary_law_results = session.primary_law_agent.llm_response or "No results available"
     case_law_results = session.case_law_agent.llm_response or "No results available"
     
-    # Add cantonal results if available
+    # Add cantonal law results if available
     cantonal_results = ""
     if session.has_cantonal_scope and session.cantonal_law_agent.llm_response:
         cantonal_results = f"\n\n--- CANTONAL LAW ({session.canton}) ---\n{session.cantonal_law_agent.llm_response}"
+    
+    # Add cantonal case law results if available
+    cantonal_case_results = ""
+    if session.has_cantonal_scope and session.cantonal_case_law_agent.llm_response:
+        cantonal_case_results = f"\n\n--- CANTONAL CASE LAW ({session.canton}) ---\n{session.cantonal_case_law_agent.llm_response}"
     
     # Combine primary and cantonal law for analysis
     combined_primary_law = primary_law_results
     if cantonal_results:
         combined_primary_law = f"{primary_law_results}{cantonal_results}"
     
+    # Combine federal and cantonal case law
+    combined_case_law = case_law_results
+    if cantonal_case_results:
+        combined_case_law = f"{case_law_results}{cantonal_case_results}"
+    
     # Use prompts from prompts.py with orchestrator context
     agent.system_prompt, agent.user_prompt = get_analysis_prompt(
         primary_law=combined_primary_law,
-        case_law=case_law_results,
+        case_law=combined_case_law,  # Now includes cantonal case law!
         question=session.question,
         document_text=session.document_text,
         legal_domain=session.legal_domain,
         legal_context=session.legal_context,
         response_language=session.response_language,
         relevant_articles=session.relevant_articles,
-        irrelevant_articles=session.irrelevant_articles
+        irrelevant_articles=session.irrelevant_articles,
+        document_analysis=session.document_analysis  # NEW!
     )
     agent.llm_prompt = f"SYSTEM:\n{agent.system_prompt}\n\nUSER:\n{agent.user_prompt}"
     
@@ -1240,16 +1561,23 @@ Please analyze the cantonal law provisions."""
             "analysis": session.cantonal_law_agent.llm_response[:500] + "..." if session.cantonal_law_agent.llm_response else None,
             "full_length": len(session.cantonal_law_agent.llm_response) if session.cantonal_law_agent.llm_response else 0
         }
+        agent.data_received["from_cantonal_case_law_agent"] = {
+            "canton": session.canton,
+            "analysis": session.cantonal_case_law_agent.llm_response[:500] + "..." if session.cantonal_case_law_agent.llm_response else None,
+            "full_length": len(session.cantonal_case_law_agent.llm_response) if session.cantonal_case_law_agent.llm_response else 0
+        }
     
     agent.add_log(f"Built synthesis prompt ({len(agent.llm_prompt)} chars)", "prepare")
     agent.add_log(f"Includes document: {bool(session.document_text)}", "prepare")
     if session.has_cantonal_scope:
         agent.add_log(f"Includes cantonal law: {session.canton}", "prepare")
+        agent.add_log(f"Includes cantonal case law: {session.canton}", "prepare")
     yield session
     
-    # LLM Synthesis
+    # LLM Synthesis - use stronger model for final analysis
     agent.current_action = "Generating final analysis"
-    agent.add_log(f"Sending to LLM ({model_name})", "llm_call")
+    analysis_llm, analysis_model_name = get_llm("analysis")
+    agent.add_log(f"Sending to LLM ({analysis_model_name})", "llm_call")
     agent.add_log(f"System prompt: {len(agent.system_prompt)} chars", "llm_call")
     agent.add_log(f"User prompt: {len(agent.user_prompt)} chars", "llm_call")
     yield session
@@ -1261,7 +1589,7 @@ Please analyze the cantonal law provisions."""
             SystemMessage(content=agent.system_prompt),
             HumanMessage(content=agent.user_prompt)
         ]
-        response = llm.invoke(messages)
+        response = analysis_llm.invoke(messages)
         agent.llm_response = response.content
         llm_duration = (time.time() - llm_start) * 1000
         
@@ -1369,7 +1697,8 @@ def render_agent_panel(agent: AgentState, expanded: bool = False, handoff_info: 
                         "info": "ℹ️",
                         "input": "📨",
                         "prepare": "📝",
-                        "handoff": "➡️"
+                        "handoff": "➡️",
+                        "planning": "🧠"  # NEW: for agentic planning
                     }
                     icon = event_icons.get(log["event_type"], "•")
                     st.text(f"[{log['timestamp']}] {icon} {log['message']}")
@@ -1377,8 +1706,17 @@ def render_agent_panel(agent: AgentState, expanded: bool = False, handoff_info: 
                 st.caption("No activity yet")
         
         with search_tab:
+            # Show planned queries if agentic (NEW!)
+            if agent.planned_queries:
+                st.caption("**🧠 Agent Planned Searches:**")
+                for i, q in enumerate(agent.planned_queries, 1):
+                    st.code(f"{i}. {q}", language=None)
+                if agent.planning_duration_ms > 0:
+                    st.caption(f"Planning took {agent.planning_duration_ms:.0f}ms")
+                st.divider()
+            
             if agent.search_query:
-                st.caption("**Query:**")
+                st.caption("**Executed Query:**")
                 st.code(agent.search_query, language=None)
             if agent.search_results:
                 st.caption("**Raw Results from Tavily:**")
@@ -1404,12 +1742,14 @@ def render_agent_panel(agent: AgentState, expanded: bool = False, handoff_info: 
                 st.divider()
                 st.caption("**🤖 LLM RESPONSE:**")
                 with st.container(height=300):
-                    st.markdown(agent.llm_response)
+                    response_with_links = make_links_open_in_new_tab(agent.llm_response)
+                    st.markdown(response_with_links, unsafe_allow_html=True)
         
         with result_tab:
             if agent.status == AgentStatus.COMPLETE and agent.llm_response:
                 st.success(f"✅ Produced {len(agent.llm_response)} characters of analysis")
-                st.markdown(agent.llm_response)
+                result_with_links = make_links_open_in_new_tab(agent.llm_response)
+                st.markdown(result_with_links, unsafe_allow_html=True)
             elif agent.status == AgentStatus.ERROR:
                 st.error(f"❌ Agent failed: {agent.error}")
             elif agent.status == AgentStatus.RUNNING:
@@ -1556,7 +1896,17 @@ def main():
         st.caption("Developer UI v2 — Full Agent Visibility")
     with col2:
         provider = os.getenv("LLM_PROVIDER", "openai")
-        st.info(f"LLM: **{provider}**")
+        use_claude = os.getenv("USE_CLAUDE_FOR_ANALYSIS", "true").lower() == "true"
+        has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
+        
+        if provider == "openai" and use_claude and has_anthropic:
+            st.info("🧠 4o (Orch)\n⚡ 4o-mini (Search)\n🟣 Claude (Analysis)")
+        elif provider == "openai":
+            st.info("🧠 4o (Orch/Analysis)\n⚡ 4o-mini (Search)")
+        elif provider == "anthropic":
+            st.info("🟣 Claude Sonnet (All)")
+        else:
+            st.info(f"LLM: **{provider}**")
     
     # Initialize session state
     if 'research_session' not in st.session_state:
@@ -1683,11 +2033,18 @@ def main():
         st.caption(f"{'✅' if tavily_ok else '❌'} Tavily API")
         
         llm_provider = os.getenv("LLM_PROVIDER", "openai")
+        openai_ok = bool(os.getenv("OPENAI_API_KEY"))
+        anthropic_ok = bool(os.getenv("ANTHROPIC_API_KEY"))
+        use_claude = os.getenv("USE_CLAUDE_FOR_ANALYSIS", "true").lower() == "true"
+        
         if llm_provider == "anthropic":
-            llm_ok = bool(os.getenv("ANTHROPIC_API_KEY"))
+            st.caption(f"{'✅' if anthropic_ok else '❌'} Anthropic API")
         else:
-            llm_ok = bool(os.getenv("OPENAI_API_KEY"))
-        st.caption(f"{'✅' if llm_ok else '❌'} {llm_provider.title()} API")
+            st.caption(f"{'✅' if openai_ok else '❌'} OpenAI API")
+            if use_claude:
+                st.caption(f"{'✅' if anthropic_ok else '⚠️'} Claude (Analysis)")
+                if not anthropic_ok:
+                    st.caption("   ↳ Add ANTHROPIC_API_KEY")
     
     # Main content area
     main_col, agents_col = st.columns([1, 1])
@@ -1698,7 +2055,9 @@ def main():
         output_placeholder = st.empty()
         
         if st.session_state.research_session and st.session_state.research_session.final_output:
-            output_placeholder.markdown(st.session_state.research_session.final_output)
+            # Convert links to open in new tab
+            output_with_links = make_links_open_in_new_tab(st.session_state.research_session.final_output)
+            output_placeholder.markdown(output_with_links, unsafe_allow_html=True)
         else:
             output_placeholder.info("Run a research query to see results here.")
         
@@ -1714,7 +2073,8 @@ def main():
             st.caption("Was antwortet das LLM auf exakt dieselbe Frage, aber ohne unsere Agenten-Recherche?")
             
             if st.session_state.research_session and st.session_state.research_session.benchmark_output:
-                st.markdown(st.session_state.research_session.benchmark_output)
+                benchmark_with_links = make_links_open_in_new_tab(st.session_state.research_session.benchmark_output)
+                st.markdown(benchmark_with_links, unsafe_allow_html=True)
             elif st.session_state.research_session and st.session_state.research_session.final_output:
                 st.info("Benchmark läuft nach dem Research-Run...")
             else:
@@ -1764,6 +2124,7 @@ def main():
         orchestrator_placeholder = st.empty()
         primary_placeholder = st.empty()
         cantonal_placeholder = st.empty()  # Always create placeholder
+        cantonal_case_placeholder = st.empty()  # Cantonal Case Law Agent
         case_placeholder = st.empty()
         analysis_placeholder = st.empty()
         
@@ -1784,13 +2145,19 @@ def main():
                     handoff_info=primary_handoff
                 )
             
-            # Only render cantonal agent if we have cantonal scope
+            # Only render cantonal agents if we have cantonal scope
             if session.has_cantonal_scope:
                 with cantonal_placeholder.container():
                     render_agent_panel(
                         session.cantonal_law_agent,
                         expanded=session.cantonal_law_agent.status == AgentStatus.RUNNING,
                         handoff_info=cantonal_handoff
+                    )
+                with cantonal_case_placeholder.container():
+                    render_agent_panel(
+                        session.cantonal_case_law_agent,
+                        expanded=session.cantonal_case_law_agent.status == AgentStatus.RUNNING,
+                        handoff_info=cantonal_handoff  # Same handoff info
                     )
             
             with case_placeholder.container():
@@ -1857,13 +2224,19 @@ def main():
                     handoff_info=primary_handoff
                 )
             
-            # Render cantonal agent if scope includes canton
+            # Render cantonal agents if scope includes canton
             if updated_session.has_cantonal_scope:
                 with cantonal_placeholder.container():
                     render_agent_panel(
                         updated_session.cantonal_law_agent,
                         expanded=updated_session.cantonal_law_agent.status == AgentStatus.RUNNING,
                         handoff_info=cantonal_handoff
+                    )
+                with cantonal_case_placeholder.container():
+                    render_agent_panel(
+                        updated_session.cantonal_case_law_agent,
+                        expanded=updated_session.cantonal_case_law_agent.status == AgentStatus.RUNNING,
+                        handoff_info=cantonal_handoff  # Same handoff info
                     )
             
             with case_placeholder.container():
@@ -1882,7 +2255,8 @@ def main():
             
             # Update output
             if updated_session.final_output:
-                output_placeholder.markdown(updated_session.final_output)
+                output_with_links = make_links_open_in_new_tab(updated_session.final_output)
+                output_placeholder.markdown(output_with_links, unsafe_allow_html=True)
             
             time.sleep(0.1)  # Small delay for UI updates
         

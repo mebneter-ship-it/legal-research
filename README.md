@@ -1,226 +1,200 @@
-# 🇨🇭 Swiss Multi-Agent Legal Research Assistant
+# 🇨🇭 Swiss Legal Research Assistant
 
-A powerful legal research tool that uses multiple AI agents to search and analyze Swiss law. Built with **LangGraph** for agent orchestration and **MCP (Model Context Protocol)** for tool integration.
+A multi-agent AI system for Swiss legal research, built with LangGraph and Streamlit.
 
 ## Features
 
-- **Primary Law Search**: Searches Fedlex and admin.ch for Swiss federal laws, ordinances, and constitutional provisions
-- **Case Law Search**: Searches BGer (Federal Court) for BGE decisions and precedents
-- **Multi-Agent Architecture**: Specialized agents for different research tasks
-- **Document Analysis**: Optional analysis of user-provided legal documents
-- **Bilingual Support**: Works with German, French, Italian, and English queries
-- **MCP Integration**: Can be used as an MCP server with Claude Desktop
+- **Multi-Agent Architecture**: Orchestrator → Primary Law Agent → (Cantonal Law Agent) → Case Law Agent → Analysis Agent
+- **Hybrid Approach**: Combines web research with LLM legal knowledge (research has priority)
+- **Legal Domain Recognition**: Automatically identifies the correct legal domain (Mietrecht, Arbeitsrecht, Nachbarrecht, etc.)
+- **Canton Detection**: Recognizes when cantonal law applies (e.g., "in Appenzell" → AI)
+- **Article Mapping**: Identifies relevant AND irrelevant articles to prevent domain mixing
+- **Multilingual**: German, French, Italian, English
+- **Source Transparency**: Clearly separates research results from general legal knowledge
+- **Document Analysis**: Upload PDFs, DOCX, images for context
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     User Query                               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   LangGraph Orchestrator                     │
-└─────────────────────────────────────────────────────────────┘
-          │                   │                    │
-          ▼                   ▼                    ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────────┐
-│  Primary Law    │ │   Case Law      │ │     Analysis        │
-│     Agent       │ │     Agent       │ │       Agent         │
-│                 │ │                 │ │                     │
-│ • Fedlex search │ │ • BGer search   │ │ • Synthesizes       │
-│ • Art./Abs./SR  │ │ • BGE citations │ │ • Risk analysis     │
-│ • Federal laws  │ │ • Precedents    │ │ • Recommendations   │
-└─────────────────┘ └─────────────────┘ └─────────────────────┘
-          │                   │                    │
-          └───────────────────┴────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Tavily Search API                         │
-│         (site-specific queries to Swiss legal sources)       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────┐
+│   Orchestrator  │  Analyzes question, identifies legal domain,
+│                 │  generates search queries, detects canton
+└────────┬────────┘
+         │ Passes: legal_domain, relevant_articles, 
+         │         irrelevant_articles, search_queries, canton
+         ▼
+┌─────────────────┐
+│ Primary Law     │  Searches Fedlex for federal law
+│ Agent           │  + LLM knowledge for gaps
+└────────┬────────┘
+         │
+         ▼ (if canton detected)
+┌─────────────────┐
+│ Cantonal Law    │  Searches cantonal law portals
+│ Agent           │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Case Law        │  Searches BGer for court decisions
+│ Agent           │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Analysis        │  Synthesizes all findings into
+│ Agent           │  structured legal advice
+└─────────────────┘
 ```
 
 ## Quick Start
 
-### 1. Clone/Download the Project
+### Prerequisites
+- Python 3.11+
+- Tavily API key (for web search)
+- OpenAI API key (for LLM)
+
+### Installation
 
 ```bash
-# Create project directory
-mkdir -p ~/swiss-legal-agent
-cd ~/swiss-legal-agent
+# Clone repository
+git clone https://github.com/mebneter-ship-it/legal-research.git
+cd legal-research
 
-# Copy all files here
-```
-
-### 2. Set Up Python Environment
-
-```bash
 # Create virtual environment
-python3 -m venv venv
-
-# Activate it
-source venv/bin/activate  # macOS/Linux
-# OR: venv\Scripts\activate  # Windows
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install dependencies
-pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-### 3. Configure API Keys
-
-```bash
-# Copy template
+# Configure environment
 cp .env.template .env
-
-# Edit with your keys
-nano .env  # or use any text editor
+# Edit .env with your API keys
 ```
 
-Required keys:
-- **TAVILY_API_KEY**: Get from [tavily.com](https://tavily.com) (free tier available)
-- **OPENAI_API_KEY**: Get from [platform.openai.com](https://platform.openai.com)
-- OR **ANTHROPIC_API_KEY**: Get from [console.anthropic.com](https://console.anthropic.com)
-
-**Important**: If you're using OpenAI Project keys:
-- Keys should start with `sk-proj-` (not `sk-sk-proj-`)
-- Set `LLM_PROVIDER=openai` in your .env
-
-### 4. Run the Assistant
+### Running the UI
 
 ```bash
-# Interactive mode
+streamlit run ui.py
+```
+
+### CLI Mode
+
+```bash
+# Interactive
 python main.py
 
 # Direct question
-python main.py -q "What are the notice periods in Swiss employment law?"
+python main.py -q "Was sind die Kündigungsfristen im Arbeitsrecht?"
 
-# Test run
-python main.py --test
-```
-
-## Usage Examples
-
-### Basic Legal Query
-
-```bash
-python main.py
-> Enter your legal question:
-> Was sind die Kündigungsfristen im Schweizer Arbeitsrecht?
-```
-
-### Document Analysis
-
-```bash
-python main.py
-> Enter your legal question:
-> Prüfe diesen Arbeitsvertrag auf rechtliche Risiken
-> 
-> Paste document to analyze:
-> [paste your contract text here]
-> [empty line to finish]
-```
-
-### Command Line Mode
-
-```bash
-# Quick query
-python main.py -q "Welche Formvorschriften gelten für Mietverträge?"
-
-# With document file
+# With document
 python main.py -q "Analyse this contract" -d contract.txt
 ```
 
+## Configuration
+
+Edit `.env`:
+```
+TAVILY_API_KEY=your_tavily_key
+OPENAI_API_KEY=your_openai_key
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o-mini
+```
+
+## Project Structure
+
+```
+├── ui.py              # Streamlit UI + Pipeline orchestration
+├── prompts.py         # All agent prompts
+├── agents.py          # Agent state classes
+├── tools.py           # Search tools (Tavily)
+├── main.py            # CLI interface
+├── mcp_server.py      # MCP server for Claude Desktop
+├── requirements.txt   # Dependencies
+├── .env.template      # Environment template
+├── .gitignore         # Git ignore rules
+└── HANDOVER.md        # Technical documentation
+```
+
+## Key Design Decisions
+
+### 1. Hybrid Approach
+- Research results have **priority** over LLM knowledge
+- LLM knowledge fills gaps when research doesn't find relevant articles
+- Sources are clearly labeled: "Aus Recherche" vs "Allgemeines Rechtswissen"
+
+### 2. Legal Domain Mapping
+The orchestrator maintains strict domain separation:
+
+| Domain | Articles | NOT to confuse with |
+|--------|----------|---------------------|
+| **Mietrecht** | Art. 253-274 OR | Art. 335c OR (Arbeitsrecht!) |
+| **Arbeitsrecht** | Art. 319-362 OR | Art. 271 OR (Mietrecht!) |
+| **Nachbarrecht** | Art. 679-698 ZGB | - |
+| **Familienrecht** | Art. 276-277 ZGB | - |
+
+### 3. Orchestrator Context
+Rich context passed to all agents:
+- `legal_domain`: "Mietrecht", "Arbeitsrecht", etc.
+- `relevant_articles`: Articles that apply to this domain
+- `irrelevant_articles`: Articles to AVOID (wrong domain)
+- `search_queries`: Specific queries for each agent
+- `canton`: Detected canton code (e.g., "AI" for Appenzell)
+
+### 4. Honest Uncertainty
+Better to say "Die relevanten Bestimmungen konnten nicht gefunden werden" than hallucinate wrong articles.
+
+## UI Features
+
+### Developer UI (ui.py)
+- **Research Output**: Final synthesized answer
+- **Agent Activity**: Real-time pipeline progress
+  - Pipeline tab: Visual workflow
+  - Log tab: Detailed execution log
+  - Übergaben tab: What orchestrator passes to each agent
+- **Benchmark**: Compare with direct LLM (no research)
+- **Per-Agent Details**: Search queries, prompts, raw results
+
+### Document Upload
+Supports: PDF, DOCX, TXT, MD, JPG, PNG, WEBP
+- Text PDFs: Extracted with pypdf
+- Scanned PDFs: Extracted with LLM vision
+- Images: Text extracted with LLM vision
+
 ## MCP Integration (Claude Desktop)
 
-To use with Claude Desktop:
-
-1. Locate your Claude Desktop config:
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-2. Add the server configuration:
+Add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "swiss-legal-research": {
       "command": "python",
-      "args": ["/full/path/to/swiss-legal-agent/mcp_server.py"],
+      "args": ["/path/to/legal-research/mcp_server.py"],
       "env": {
-        "TAVILY_API_KEY": "your-actual-tavily-key"
+        "TAVILY_API_KEY": "your-key"
       }
     }
   }
 }
 ```
 
-3. Restart Claude Desktop
-
-4. You'll now have Swiss legal research tools available in Claude!
-
-## File Structure
-
-```
-swiss-legal-agent/
-├── main.py              # CLI application
-├── agents.py            # LangGraph multi-agent system
-├── tools.py             # Search tool implementations
-├── mcp_server.py        # MCP server for Claude Desktop
-├── requirements.txt     # Python dependencies
-├── .env                 # Your API keys (create from template)
-├── .env.template        # Template for environment variables
-└── README.md            # This file
-```
-
-## Troubleshooting
-
-### "TAVILY_API_KEY not configured"
-- Make sure your `.env` file exists and contains valid keys
-- Check for double prefixes: key should be `tvly-xxx` not `tvly-tvly-xxx`
-
-### "OPENAI_API_KEY not configured"
-- Project keys start with `sk-proj-` (not `sk-sk-proj-`)
-- Make sure `LLM_PROVIDER=openai` is set
-
-### Import errors
-```bash
-# Make sure venv is activated
-source venv/bin/activate
-
-# Reinstall dependencies
-pip install -r requirements.txt --force-reinstall
-```
-
-### Rate limits
-- Tavily free tier: 1000 searches/month
-- Consider upgrading if you hit limits
-
 ## Supported Legal Sources
 
 | Source | URL | Content |
 |--------|-----|---------|
 | Fedlex | fedlex.admin.ch | Federal laws, ordinances, SR collection |
-| admin.ch | admin.ch | Government publications, official texts |
 | BGer | bger.ch | Federal Court decisions (BGE) |
+| Cantonal | varies | Cantonal law portals |
 
 ## Limitations
 
-- **Not legal advice**: This tool is for research assistance only
-- **Search quality**: Results depend on Tavily's indexing of Swiss sources
-- **Language**: Best results with German queries; French/Italian supported
-- **Currency**: May not have the most recent law changes
-
-## Contributing
-
-Feel free to submit issues or PRs for:
-- Additional Swiss legal sources
-- Improved search queries
-- Better citation formatting
-- Additional language support
+- **Not legal advice**: Research assistance only
+- **Search quality**: Depends on Tavily's indexing
+- **BGE numbers**: Only cite when found in research (no hallucination)
+- **Cantonal law**: Highly variable, recommend checking official sources
 
 ## License
 
-MIT License - Use freely with attribution.
+MIT License
